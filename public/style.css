@@ -304,8 +304,18 @@ a { color: var(--amber); }
 .sheet {
   background: var(--panel); border-radius: 18px 18px 0 0;
   width: 100%; max-width: 560px; max-height: 88dvh; overflow-y: auto;
+  -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+  touch-action: pan-y;
   padding: 18px 16px calc(env(safe-area-inset-bottom) + 18px);
   display: flex; flex-direction: column; gap: 10px;
+  position: relative;
+}
+.sheet-x {
+  position: sticky; top: 0; align-self: flex-end; z-index: 5;
+  width: 34px; height: 34px; border-radius: 50%; flex: none;
+  background: var(--panel2); color: var(--ink-dim); font-size: 16px;
+  display: flex; align-items: center; justify-content: center;
+  margin: -6px -4px -34px 0;
 }
 .sheet h2 { font-family: var(--serif); color: var(--ink); font-size: 21px; }
 .sheet label { font-size: 13px; color: var(--ink-dim); margin-bottom: -5px; }

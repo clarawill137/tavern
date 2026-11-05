@@ -320,6 +320,7 @@ function charsTabHtml() {
   const w = world();
   const ai = S.ai_chars.filter(c => !c.world_id || !w || c.world_id === w.id);
   return `<div class="pad">
+    ${worldChipsHtml()}
     <div class="h-sect">
       <h2>Персонажи</h2>
       <button class="btn small ghost" id="ct-mine">🎭 Мои</button>
@@ -724,8 +725,9 @@ function sheet(html, setup) {
   closeSheet();
   const ov = document.createElement('div');
   ov.className = 'overlay';
-  ov.innerHTML = `<div class="sheet">${html}</div>`;
+  ov.innerHTML = `<div class="sheet"><button class="sheet-x" aria-label="Закрыть">✕</button>${html}</div>`;
   ov.onclick = e => { if (e.target === ov) closeSheet(); };
+  ov.querySelector('.sheet-x').onclick = closeSheet;
   document.body.appendChild(ov);
   if (setup) setup(ov.querySelector('.sheet'));
 }
