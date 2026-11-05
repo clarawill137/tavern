@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { q, now, getSetting, setSetting, DATA_DIR } = require('./db');
 const { aiPost, chronicle, spentToday, dailyLimitFor } = require('./ai');
+const { NEEDS, computeNeeds, parseMemory } = require('./game');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -54,12 +55,14 @@ const publicPost = p => ({
   ai_char_id: p.ai_char_id, body: p.body, image: p.image || '', is_ooc: !!p.is_ooc,
   created_at: p.created_at, edited_at: p.edited_at,
 });
-const publicRoom = (r, lastTimes) => ({
+const publicRoom = (r, lastTimes, previews) => ({
   id: r.id, world_id: r.world_id, title: r.title, kind: r.kind, category: r.category,
   description: r.description, cover: r.cover || '', auto_ai_char_id: r.auto_ai_char_id,
+  map_x: r.map_x, map_y: r.map_y,
   chronicle: r.chronicle, chronicle_at: r.chronicle_at,
   ai_ids: q.roomAi.all(r.id).map(x => x.ai_char_id),
   last_at: lastTimes?.[r.id]?.last_at || null, post_count: lastTimes?.[r.id]?.n || 0,
+  preview: previews?.[r.id] || null,
 });
 
 // ---------- SSE ----------
@@ -163,11 +166,18 @@ route('POST', '/api/logout', async (req, res) => {
 route('GET', '/api/state', async (req, res, { user }) => {
   const lastTimes = {};
   for (const r of q.lastPostTimes.all()) lastTimes[r.room_id] = { last_at: r.last_at, n: r.n };
+  const previews = {};
+  for (const p of q.lastPostPreviews.all()) {
+    let who = '';
+    if (p.ai_char_id) who = q.aiCharById.get(p.ai_char_id)?.name || '';
+    else if (p.persona_id) who = q.personaById.get(p.persona_id)?.name || '';
+    previews[p.room_id] = (who ? who + ': ' : '') + p.body.slice(0, 90);
+  }
   json(res, 200, {
     me: publicUser(user),
     app_title: getSetting('app_title', 'Таверна'),
-    worlds: q.allWorlds.all().map(w => ({ id: w.id, title: w.title, emoji: w.emoji, cover: w.cover, accent: w.accent })),
-    rooms: q.allRooms.all().map(r => publicRoom(r, lastTimes)),
+    worlds: q.allWorlds.all().map(w => ({ id: w.id, title: w.title, emoji: w.emoji, cover: w.cover, accent: w.accent, map: w.map || '' })),
+    rooms: q.allRooms.all().map(r => publicRoom(r, lastTimes, previews)),
     my_personas: q.personasByUser.all(user.id),
     all_personas: q.allPersonas.all().map(p => ({ id: p.id, name: p.name, emoji: p.emoji, color: p.color, avatar: p.avatar || '', username: p.username, user_id: p.user_id })),
     ai_chars: q.aiChars.all().map(c => ({ id: c.id, world_id: c.world_id, name: c.name, emoji: c.emoji, color: c.color, avatar: c.avatar || '', model: c.model })),
@@ -227,6 +237,76 @@ route('DELETE', '/api/personas/:id', async (req, res, { params, user }) => {
   json(res, 200, { ok: true });
 });
 
+// ----- игровой движок: профиль персонажа, инвентарь, память, потребности -----
+route('GET', '/api/personas/:id/state', async (req, res, { params, user }) => {
+  const p = q.personaById.get(params.id);
+  if (!p || p.deleted) return err(res, 404, 'Нет персонажа');
+  const mine = p.user_id === user.id;
+  json(res, 200, {
+    persona: { id: p.id, name: p.name, emoji: p.emoji, color: p.color, avatar: p.avatar || '', bio: p.bio, user_id: p.user_id, realism: !!p.realism },
+    mine,
+    needs: computeNeeds(p),
+    need_labels: NEEDS.map(([k, label]) => [k, label]),
+    memory: parseMemory(p),
+    items: (mine ? q.itemsByPersona.all(p.id) : q.equippedByPersona.all(p.id)),
+  });
+});
+
+route('PATCH', '/api/personas/:id/memory', async (req, res, { params, user }) => {
+  const p = q.personaById.get(params.id);
+  if (!p || p.user_id !== user.id) return err(res, 404, 'Не твой персонаж');
+  const { memory } = await readBody(req);
+  if (!Array.isArray(memory)) return err(res, 400, 'memory должен быть списком строк');
+  q.setPersonaMemory.run(JSON.stringify(memory.map(String).slice(0, 100)), p.id);
+  json(res, 200, { ok: true });
+});
+
+route('PATCH', '/api/personas/:id/needs', async (req, res, { params, user }) => {
+  const p = q.personaById.get(params.id);
+  if (!p || p.user_id !== user.id) return err(res, 404, 'Не твой персонаж');
+  const b = await readBody(req);
+  const cur = computeNeeds(p);
+  const nowT = now();
+  const raw = {};
+  for (const [k] of NEEDS) {
+    const v = b.needs && typeof b.needs[k] === 'number' ? b.needs[k] : cur[k];
+    raw[k] = { v: Math.max(5, Math.min(100, v)), at: nowT };
+  }
+  const realism = b.realism != null ? (b.realism ? 1 : 0) : p.realism;
+  q.setPersonaNeeds.run(JSON.stringify(raw), realism, p.id);
+  json(res, 200, { ok: true, needs: computeNeeds({ ...p, needs: JSON.stringify(raw), realism }) });
+});
+
+route('POST', '/api/personas/:id/items', async (req, res, { params, user }) => {
+  const p = q.personaById.get(params.id);
+  if (!p || p.user_id !== user.id) return err(res, 404, 'Не твой персонаж');
+  const b = await readBody(req);
+  if (!b.name) return err(res, 400, 'Название обязательно');
+  const kind = ['одежда', 'транспорт', 'вещь'].includes(b.kind) ? b.kind : 'вещь';
+  const r = q.insertItem.run(p.id, kind, String(b.name), b.descr || '', b.image || '', b.equipped ? 1 : 0, now());
+  json(res, 200, { ok: true, id: Number(r.lastInsertRowid) });
+});
+
+route('PATCH', '/api/items/:id', async (req, res, { params, user }) => {
+  const it = q.itemById.get(params.id);
+  if (!it) return err(res, 404, 'Нет предмета');
+  const p = q.personaById.get(it.persona_id);
+  if (!p || p.user_id !== user.id) return err(res, 403, 'Не твой предмет');
+  const b = await readBody(req);
+  q.updateItem.run(b.kind ?? it.kind, b.name ?? it.name, b.descr ?? it.descr, b.image ?? it.image,
+    b.equipped != null ? (b.equipped ? 1 : 0) : it.equipped, it.id);
+  json(res, 200, { ok: true });
+});
+
+route('DELETE', '/api/items/:id', async (req, res, { params, user }) => {
+  const it = q.itemById.get(params.id);
+  if (!it) return err(res, 404, 'Нет предмета');
+  const p = q.personaById.get(it.persona_id);
+  if (!p || p.user_id !== user.id) return err(res, 403, 'Не твой предмет');
+  q.deleteItem.run(it.id);
+  json(res, 200, { ok: true });
+});
+
 // ----- миры -----
 route('POST', '/api/worlds', async (req, res) => {
   const b = await readBody(req);
@@ -247,7 +327,8 @@ route('PATCH', '/api/worlds/:id', async (req, res, { params }) => {
   if (!w) return err(res, 404, 'Нет мира');
   const b = await readBody(req);
   q.updateWorld.run(b.title ?? w.title, b.emoji ?? w.emoji, b.cover ?? w.cover, b.prompt ?? w.prompt,
-    b.accent ?? w.accent, b.position ?? w.position, b.archived != null ? (b.archived ? 1 : 0) : w.archived, w.id);
+    b.accent ?? w.accent, b.position ?? w.position, b.archived != null ? (b.archived ? 1 : 0) : w.archived,
+    b.map ?? w.map ?? '', w.id);
   broadcast({ type: 'rooms' });
   json(res, 200, { ok: true });
 }, { admin: true });
@@ -274,7 +355,9 @@ route('PATCH', '/api/rooms/:id', async (req, res, { params }) => {
     b.description ?? room.description, b.cover ?? room.cover,
     b.auto_ai_char_id !== undefined ? (b.auto_ai_char_id || null) : room.auto_ai_char_id,
     b.position ?? room.position,
-    b.archived != null ? (b.archived ? 1 : 0) : room.archived, room.id);
+    b.archived != null ? (b.archived ? 1 : 0) : room.archived,
+    b.map_x !== undefined ? b.map_x : room.map_x,
+    b.map_y !== undefined ? b.map_y : room.map_y, room.id);
   if (Array.isArray(b.ai_ids)) {
     q.clearRoomAi.run(room.id);
     for (const id of b.ai_ids) q.addRoomAi.run(room.id, id);

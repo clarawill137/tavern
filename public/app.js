@@ -4,22 +4,23 @@
 const $app = document.getElementById('app');
 let S = null;
 let curRoom = null;
-let curWorld = null;
 let posts = [];
 let composer = { persona_id: null, ooc: false, image: '' };
 let sse = null;
 let extLoaded = false;
+let tab = 'rooms';
+let curWorldId = parseInt(localStorage.getItem('tavern_world') || '0', 10) || null;
 
 // ---------- темы ----------
 const THEMES = [
-  ['candle', 'Свечная'], ['parchment', 'Пергамент'], ['midnight', 'Полночь'],
-  ['grove', 'Роща'], ['noir', 'Нуар'],
+  ['wine', 'Графит и вино'], ['candle', 'Свечная'], ['parchment', 'Пергамент'],
+  ['midnight', 'Полночь'], ['grove', 'Роща'],
 ];
 function applyTheme(t) {
   document.body.dataset.theme = t;
   localStorage.setItem('tavern_theme', t);
 }
-applyTheme(localStorage.getItem('tavern_theme') || 'candle');
+applyTheme(localStorage.getItem('tavern_theme') || 'wine');
 
 // ---------- utils ----------
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -28,13 +29,17 @@ const fmtTime = ts => {
   if (!ts) return '';
   const d = new Date(ts), today = new Date();
   const hm = d.toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' });
-  if (d.toDateString() === today.toDateString()) return hm;
-  return d.toLocaleDateString('ru', { day: 'numeric', month: 'short' }) + ' ' + hm;
+  if (d.toDateString() === today.toDateString()) return 'Сегодня, ' + hm;
+  const yest = new Date(today.getTime() - 864e5);
+  if (d.toDateString() === yest.toDateString()) return 'Вчера, ' + hm;
+  return d.toLocaleDateString('ru', { day: 'numeric', month: 'short' }) + ', ' + hm;
 };
 const money = v => '$' + (v || 0).toFixed(v >= 1 ? 2 : 3);
-const avaHtml = (a) => a.avatar
-  ? `<div class="ava" style="border-color:${a.color};background-image:url('${esc(a.avatar)}')"></div>`
-  : `<div class="ava" style="border-color:${a.color}">${a.emoji}</div>`;
+const avaHtml = (a, cls = 'ava') => a.avatar
+  ? `<div class="${cls}" style="border-color:${a.color};background-image:url('${esc(a.avatar)}')"></div>`
+  : `<div class="${cls}" style="border-color:${a.color}">${a.emoji}</div>`;
+
+function world() { return S.worlds.find(w => w.id === curWorldId) || S.worlds[0] || null; }
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -57,7 +62,7 @@ function toast(text, bad = false) {
   setTimeout(() => t.remove(), bad ? 5000 : 2500);
 }
 
-// ---------- загрузка картинок (с сжатием на телефоне) ----------
+// ---------- загрузка картинок ----------
 function pickImage(cb) {
   const inp = document.createElement('input');
   inp.type = 'file'; inp.accept = 'image/*';
@@ -84,7 +89,6 @@ function pickImage(cb) {
   inp.click();
 }
 
-// кнопка-поле «обложка» для форм
 function coverField(id, current) {
   return `<div class="row2" style="align-items:center">
     <button type="button" class="btn ghost small" id="${id}-btn">🖼 ${current ? 'Сменить картинку' : 'Загрузить картинку'}</button>
@@ -118,16 +122,16 @@ function loadExtensions() {
   }
 }
 
-// ---------- авторы постов ----------
+// ---------- авторы ----------
 function author(p) {
   if (p.ai_char_id) {
     const c = S.ai_chars.find(c => c.id === p.ai_char_id);
-    return { name: c ? c.name : 'ИИ', sub: 'ИИ', emoji: c?.emoji || '🤖', color: c?.color || '#9d7bff', avatar: c?.avatar || '', ai: true };
+    return { name: c ? c.name : 'ИИ', sub: 'ИИ', emoji: c?.emoji || '🤖', color: c?.color || '#c99ba8', avatar: c?.avatar || '', ai: true };
   }
   if (p.persona_id) {
     const pe = S.all_personas.find(x => x.id === p.persona_id);
     return pe
-      ? { name: pe.name, sub: 'игрок: ' + pe.username, emoji: pe.emoji, color: pe.color, avatar: pe.avatar || '' }
+      ? { name: pe.name, sub: 'игрок: ' + pe.username, emoji: pe.emoji, color: pe.color, avatar: pe.avatar || '', pid: pe.id }
       : { name: '???', sub: '', emoji: '🎭', color: '#777', avatar: '' };
   }
   const u = S.users.find(u => u.id === p.user_id);
@@ -145,7 +149,7 @@ function connectSSE() {
         posts.push(ev.post); renderFeedAppend(ev.post);
       }
       const r = S?.rooms.find(r => r.id === ev.post.room_id);
-      if (r) { r.last_at = ev.post.created_at; r.post_count++; }
+      if (r) { r.last_at = ev.post.created_at; r.post_count++; r.preview = ev.post.body.slice(0, 90); }
       if (!curRoom) render();
     } else if (ev.type === 'post_edit' && curRoom && ev.post.room_id === curRoom.id) {
       const i = posts.findIndex(p => p.id === ev.post.id);
@@ -170,6 +174,7 @@ async function refreshState() {
   S = await api('/api/state');
   if (!composer.persona_id && S.my_personas[0]) composer.persona_id = S.my_personas[0].id;
   if (composer.persona_id && !S.my_personas.find(p => p.id === composer.persona_id)) composer.persona_id = null;
+  if (!S.worlds.find(w => w.id === curWorldId)) curWorldId = S.worlds[0]?.id || null;
   loadExtensions();
 }
 
@@ -178,16 +183,12 @@ window.addEventListener('hashchange', () => route());
 async function route() {
   const h = location.hash || '#/';
   let m;
-  curRoom = null; curWorld = null;
-  if (S) {
-    if ((m = h.match(/^#\/room\/(\d+)/))) {
-      curRoom = S.rooms.find(r => r.id === +m[1]) || null;
-      if (curRoom) {
-        curWorld = S.worlds.find(w => w.id === curRoom.world_id) || null;
-        posts = (await api(`/api/rooms/${curRoom.id}/posts?limit=50`)).posts;
-      }
-    } else if ((m = h.match(/^#\/world\/(\d+)/))) {
-      curWorld = S.worlds.find(w => w.id === +m[1]) || null;
+  curRoom = null;
+  if (S && (m = h.match(/^#\/room\/(\d+)/))) {
+    curRoom = S.rooms.find(r => r.id === +m[1]) || null;
+    if (curRoom) {
+      curWorldId = curRoom.world_id; localStorage.setItem('tavern_world', curWorldId);
+      posts = (await api(`/api/rooms/${curRoom.id}/posts?limit=50`)).posts;
     }
   }
   render();
@@ -210,8 +211,7 @@ function render() {
   if (h === '#/admin') return renderAdmin();
   let m;
   if ((m = h.match(/^#\/lore\/(\d+)/))) return renderLore(+m[1]);
-  if (curWorld) return renderWorld();
-  renderHome();
+  renderTabs();
 }
 
 // ----- логин -----
@@ -250,75 +250,338 @@ function renderLogin(mode = 'login') {
   };
 }
 
-// ----- главная: миры -----
-function renderHome() {
-  if (S.worlds.length === 1) { location.hash = `#/world/${S.worlds[0].id}`; return; }
+// ----- каркас с табами -----
+const TABS = [
+  ['rooms', '💬', 'Комнаты'], ['chars', '👥', 'Персонажи'], ['map', '🗺', 'Мир'], ['settings', '⚙️', 'Настройки'],
+];
+function renderTabs() {
+  const myAva = S.my_personas.find(p => p.avatar);
+  let content = '';
+  if (tab === 'rooms') content = roomsTabHtml();
+  else if (tab === 'chars') content = charsTabHtml();
+  else if (tab === 'map') content = mapTabHtml();
+  else content = settingsTabHtml();
   $app.innerHTML = `
   <div class="topbar">
     <h1>🕯️ ${esc(S.app_title)}</h1>
-    <button class="iconbtn" id="b-theme" title="Тема">🎨</button>
-    <button class="iconbtn" id="b-personas" title="Мои персонажи">🎭</button>
-    <button class="iconbtn" onclick="location.hash='#/usage'" title="Траты">💰</button>
-    ${S.me.is_admin ? `<button class="iconbtn" onclick="location.hash='#/admin'" title="Админка">⚙️</button>` : ''}
-    <button class="iconbtn" id="b-logout" title="Выйти">🚪</button>
+    <div class="top-ava" ${myAva ? `style="background-image:url('${esc(myAva.avatar)}')"` : ''}>${myAva ? '' : '🎭'}</div>
   </div>
-  <div class="screen pad">
-    ${S.worlds.map(w => worldCardHtml(w)).join('') ||
-      `<div class="hint" style="margin-top:30vh;text-align:center">Миров пока нет.${S.me.is_admin ? '<br>Создай первый в ⚙️ админке.' : ''}</div>`}
+  <div class="screen" id="tabscreen">${content}</div>
+  <div class="tabbar">
+    ${TABS.map(([id, icon, label]) => `
+      <button class="${tab === id ? 'on' : ''}" data-tab="${id}"><span class="ti">${icon}</span>${label}</button>`).join('')}
   </div>`;
-  bindHomeButtons();
+  document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { tab = b.dataset.tab; renderTabs(); });
+  bindTab();
 }
-function worldCardHtml(w) {
-  const rooms = S.rooms.filter(r => r.world_id === w.id);
+
+function worldChipsHtml() {
+  if (S.worlds.length <= 1) return '';
+  return `<div class="world-chips">
+    ${S.worlds.map(w => `<button class="chip ${w.id === curWorldId ? 'on' : ''}" data-world="${w.id}">${w.emoji} ${esc(w.title)}</button>`).join('')}
+  </div>`;
+}
+function bindWorldChips() {
+  document.querySelectorAll('[data-world]').forEach(b => b.onclick = () => {
+    curWorldId = +b.dataset.world; localStorage.setItem('tavern_world', curWorldId); renderTabs();
+  });
+}
+
+// ----- таб: комнаты -----
+function roomsTabHtml() {
+  const w = world();
+  const rooms = w ? S.rooms.filter(r => r.world_id === w.id).slice().sort((a, b) => (b.last_at || 0) - (a.last_at || 0)) : [];
+  return `<div class="pad">
+    ${worldChipsHtml()}
+    <div class="h-sect">
+      <h2>Ваши истории</h2>
+      ${S.me.is_admin ? `<button class="btn small" id="rt-newroom">＋ Комната</button>` : ''}
+    </div>
+    ${rooms.map(storyCardHtml).join('') ||
+      `<div class="hint" style="margin-top:20vh;text-align:center">Комнат пока нет.${S.me.is_admin ? '<br>Жми «＋ Комната».' : ' Жди админа.'}</div>`}
+  </div>`;
+}
+function storyCardHtml(r) {
   return `
-  <button class="world-card ${w.cover ? '' : 'nocover'}" ${w.cover ? `style="background-image:url('${esc(w.cover)}')"` : ''}
-    onclick="location.hash='#/world/${w.id}'">
-    <div class="wshade">
-      <div class="wt">${w.emoji} ${esc(w.title)}</div>
-      <div class="ws">${rooms.length} комнат</div>
+  <button class="story-card" onclick="location.hash='#/room/${r.id}'">
+    <div class="thumb" ${r.cover ? `style="background-image:url('${esc(r.cover)}')"` : ''}>${r.cover ? '' : (r.kind === 'chat' ? '💬' : '📜')}</div>
+    <div class="sc-body">
+      <div class="sc-top">
+        <div class="sc-title">${esc(r.title)}</div>
+        <div class="sc-time">${r.last_at ? fmtTime(r.last_at) : ''}</div>
+      </div>
+      <div class="sc-prev">${esc(r.preview || r.description || '…')}</div>
     </div>
   </button>`;
 }
-function bindHomeButtons() {
-  const t = document.getElementById('b-theme'); if (t) t.onclick = themeSheet;
-  const p = document.getElementById('b-personas'); if (p) p.onclick = personasSheet;
-  const l = document.getElementById('b-logout');
-  if (l) l.onclick = async () => { await api('/api/logout', { method: 'POST' }); S = null; location.hash = ''; render(); };
+
+// ----- таб: персонажи -----
+function charsTabHtml() {
+  const w = world();
+  const ai = S.ai_chars.filter(c => !c.world_id || !w || c.world_id === w.id);
+  return `<div class="pad">
+    <div class="h-sect">
+      <h2>Персонажи</h2>
+      <button class="btn small ghost" id="ct-mine">🎭 Мои</button>
+    </div>
+    <div class="char-grid">
+      ${S.all_personas.map(p => `
+        <button class="char-card" data-pp="${p.id}">
+          <div class="cc-img" ${p.avatar ? `style="background-image:url('${esc(p.avatar)}')"` : ''}>${p.avatar ? '' : p.emoji}</div>
+          <div class="cc-name">${esc(p.name)}</div>
+          <div class="cc-sub">${esc(p.username)}</div>
+        </button>`).join('')}
+      ${ai.map(c => `
+        <button class="char-card" data-ai-card="${c.id}">
+          <div class="cc-img" ${c.avatar ? `style="background-image:url('${esc(c.avatar)}')"` : ''}>${c.avatar ? '' : c.emoji}</div>
+          <div class="cc-name">${esc(c.name)}</div>
+          <div class="cc-sub">ИИ</div>
+        </button>`).join('')}
+    </div>
+  </div>`;
 }
 
-// ----- мир: комнаты -----
-function renderWorld() {
-  const w = curWorld;
+// ----- таб: карта -----
+function mapTabHtml() {
+  const w = world();
+  if (!w) return `<div class="pad hint">Миров нет.</div>`;
   const rooms = S.rooms.filter(r => r.world_id === w.id);
-  const cats = {};
-  for (const r of rooms) (cats[r.category] ||= []).push(r);
-  const multi = S.worlds.length > 1;
-  $app.innerHTML = `
-  <div class="topbar">
-    ${multi ? `<button class="back" onclick="location.hash='#/'">‹</button>` : ''}
-    <h1>${w.emoji} ${esc(w.title)}</h1>
-    <button class="iconbtn" id="b-theme" title="Тема">🎨</button>
-    <button class="iconbtn" id="b-personas" title="Мои персонажи">🎭</button>
-    <button class="iconbtn" onclick="location.hash='#/usage'" title="Траты">💰</button>
-    ${S.me.is_admin ? `<button class="iconbtn" onclick="location.hash='#/admin'" title="Админка">⚙️</button>` : ''}
-    ${multi ? '' : `<button class="iconbtn" id="b-logout" title="Выйти">🚪</button>`}
-  </div>
-  <div class="screen pad">
-    ${Object.entries(cats).map(([cat, list]) => `
-      <div class="cat-label">${esc(cat)}</div>
-      ${list.map(r => `
-        <button class="room-card ${r.cover ? 'covered' : ''}" ${r.cover ? `style="background-image:url('${esc(r.cover)}')"` : ''}
-          onclick="location.hash='#/room/${r.id}'">
-          <div class="ric">${r.kind === 'chat' ? '💬' : '📜'}</div>
-          <div>
-            <div class="rt">${esc(r.title)}</div>
-            ${r.description ? `<div class="rd">${esc(r.description)}</div>` : ''}
-          </div>
-          <div class="rmeta">${r.post_count ? `${r.post_count}<br>${fmtTime(r.last_at)}` : '—'}</div>
-        </button>`).join('')}
-    `).join('') || `<div class="hint" style="margin-top:30vh;text-align:center">Комнат пока нет.${S.me.is_admin ? '<br>Создай первую в ⚙️ админке.' : ' Жди админа.'}</div>`}
+  const pinned = rooms.filter(r => r.map_x != null && r.map_y != null);
+  return `<div>
+    <div class="pad" style="padding-bottom:0">
+      ${worldChipsHtml()}
+      <div class="h-sect"><h2>${w.emoji} ${esc(w.title)}</h2>
+        ${S.me.is_admin ? `<button class="btn small ghost" id="mt-setup">📍 Метки</button>` : ''}
+      </div>
+    </div>
+    ${w.map ? `
+      <div class="map-wrap" id="mapwrap">
+        <img src="${esc(w.map)}" draggable="false">
+        ${pinned.map(r => `
+          <button class="map-pin" data-pin="${r.id}" style="left:${r.map_x}%;top:${r.map_y}%">
+            <span class="mp-dot">📍</span><span class="mp-label">${esc(r.title)}</span>
+          </button>`).join('')}
+      </div>
+      ${pinned.length ? '' : `<div class="hint map-hint">Меток пока нет${S.me.is_admin ? ' — жми «📍 Метки» и расставь локации' : ''}.</div>`}
+    ` : `<div class="pad hint">У этого мира ещё нет карты.${S.me.is_admin ? ' Загрузи её: ⚙️ Настройки → Админка → ✏️ мира → «Карта мира».' : ''}</div>`}
   </div>`;
-  bindHomeButtons();
+}
+
+function bindTab() {
+  bindWorldChips();
+  const nr = document.getElementById('rt-newroom'); if (nr) nr.onclick = () => roomForm();
+  const cm = document.getElementById('ct-mine'); if (cm) cm.onclick = personasSheet;
+  document.querySelectorAll('[data-pp]').forEach(b => b.onclick = () => personaProfile(+b.dataset.pp));
+  document.querySelectorAll('[data-ai-card]').forEach(b => b.onclick = () => {
+    const c = S.ai_chars.find(x => x.id === +b.dataset.aiCard);
+    if (c) sheet(`<h2>${c.emoji} ${esc(c.name)}</h2><div class="hint">ИИ-персонаж · ${esc(c.model)}</div>
+      ${c.avatar ? `<img src="${esc(c.avatar)}" style="width:100%;border-radius:12px">` : ''}`);
+  });
+  document.querySelectorAll('[data-pin]').forEach(b => b.onclick = () => { location.hash = `#/room/${b.dataset.pin}`; });
+  const ms = document.getElementById('mt-setup'); if (ms) ms.onclick = mapSetupSheet;
+  // настройки
+  const st = document.getElementById('set-theme'); if (st) st.onclick = themeSheet;
+  const sp = document.getElementById('set-personas'); if (sp) sp.onclick = personasSheet;
+  const su = document.getElementById('set-usage'); if (su) su.onclick = () => location.hash = '#/usage';
+  const sa = document.getElementById('set-admin'); if (sa) sa.onclick = () => location.hash = '#/admin';
+  const so = document.getElementById('set-out'); if (so) so.onclick = async () => {
+    await api('/api/logout', { method: 'POST' }); S = null; location.hash = ''; render();
+  };
+}
+
+// админ: расстановка меток на карте
+function mapSetupSheet() {
+  const w = world();
+  if (!w.map) return toast('Сначала загрузи карту мира (Админка → ✏️ мира)', true);
+  const rooms = S.rooms.filter(r => r.world_id === w.id);
+  sheet(`
+    <h2>📍 Метки на карте</h2>
+    <div class="hint">Выбери локацию — потом тапни точку на карте.</div>
+    ${rooms.map(r => `
+      <button class="list-item" data-place="${r.id}">
+        <div>${r.map_x != null ? '📍' : '◻️'}</div>
+        <div class="grow"><div class="t">${esc(r.title)}</div></div>
+        ${r.map_x != null ? `<button class="iconbtn" data-unpin="${r.id}">✖</button>` : ''}
+      </button>`).join('')}
+  `, s => {
+    s.querySelectorAll('[data-unpin]').forEach(b => b.onclick = async (e) => {
+      e.stopPropagation();
+      await api(`/api/rooms/${b.dataset.unpin}`, { method: 'PATCH', body: { map_x: null, map_y: null } });
+      await refreshState(); closeSheet(); renderTabs(); toast('Метка убрана');
+    });
+    s.querySelectorAll('[data-place]').forEach(b => b.onclick = () => {
+      const roomId = +b.dataset.place;
+      closeSheet();
+      toast('Тапни точку на карте');
+      const wrap = document.getElementById('mapwrap');
+      if (!wrap) return;
+      const handler = async (e) => {
+        const rect = wrap.getBoundingClientRect();
+        const x = ((e.clientX - rect.left) / rect.width * 100).toFixed(1);
+        const y = ((e.clientY - rect.top) / rect.height * 100).toFixed(1);
+        wrap.removeEventListener('click', handler, true);
+        await api(`/api/rooms/${roomId}`, { method: 'PATCH', body: { map_x: +x, map_y: +y } });
+        await refreshState(); renderTabs(); toast('Метка поставлена');
+      };
+      wrap.addEventListener('click', handler, true);
+    });
+  });
+}
+
+// ----- таб: настройки -----
+function settingsTabHtml() {
+  return `<div class="pad">
+    <div class="h-sect"><h2>Настройки</h2></div>
+    <button class="list-item" id="set-personas" style="width:100%;text-align:left"><div>🎭</div><div class="grow"><div class="t">Мои персонажи</div></div>›</button>
+    <button class="list-item" id="set-theme" style="width:100%;text-align:left"><div>🎨</div><div class="grow"><div class="t">Тема оформления</div></div>›</button>
+    <button class="list-item" id="set-usage" style="width:100%;text-align:left"><div>💰</div><div class="grow"><div class="t">Траты за месяц</div></div>›</button>
+    ${S.me.is_admin ? `<button class="list-item" id="set-admin" style="width:100%;text-align:left"><div>👑</div><div class="grow"><div class="t">Админка</div></div>›</button>` : ''}
+    <button class="list-item" id="set-out" style="width:100%;text-align:left"><div>🚪</div><div class="grow"><div class="t">Выйти (${esc(S.me.username)})</div></div></button>
+    <div class="hint" style="margin-top:10px">Сегодня потрачено: ${money(S.spent_today)}${S.daily_limit != null ? ` из ${money(S.daily_limit)}` : ''}</div>
+  </div>`;
+}
+
+// ----- профиль персонажа: инвентарь, потребности, память -----
+async function personaProfile(pid, kindTab = 'одежда') {
+  let st;
+  try { st = await api(`/api/personas/${pid}/state`); } catch (e) { return toast(e.message, true); }
+  const p = st.persona;
+  const kinds = ['одежда', 'транспорт', 'вещь'];
+  const kindLabel = { 'одежда': '👗 Шмот', 'транспорт': '🚗 Транспорт', 'вещь': '🎒 Вещи' };
+  const items = st.items.filter(i => i.kind === kindTab);
+  sheet(`
+    <div style="display:flex;gap:12px;align-items:center">
+      ${avaHtml(p)}
+      <div><h2 style="margin:0">${esc(p.name)}</h2><div class="hint">${esc(p.bio || '')}</div></div>
+    </div>
+
+    <div class="sect" style="margin-top:8px"><h3>Состояние</h3>
+      ${st.need_labels.map(([k, label]) => `
+        <div class="need-row" style="margin-bottom:7px">
+          <div class="nr-label">${label}</div>
+          <div class="need-bar ${st.needs[k] < 30 ? 'low' : ''}"><div style="width:${st.needs[k]}%"></div></div>
+          <div class="nr-val">${st.needs[k]}</div>
+        </div>`).join('')}
+      ${st.mine ? `
+        <div class="checkline" style="margin-top:6px"><input type="checkbox" id="pp-realism" ${p.realism ? 'checked' : ''}>
+          <span>Реализм: потребности проседают со временем</span></div>
+        <button class="btn ghost small" id="pp-needs" style="margin-top:8px">⚙️ Подправить состояние</button>` : ''}
+    </div>
+
+    <div class="sect"><h3>Инвентарь ${st.mine ? '' : '(что надето/при себе)'}</h3>
+      <div class="seg">
+        ${kinds.map(k => `<button data-ktab="${k}" class="${k === kindTab ? 'on' : ''}">${kindLabel[k]}</button>`).join('')}
+      </div>
+      <div style="margin-top:9px">
+      ${items.map(i => `
+        <div class="inv-item ${i.equipped ? 'on' : ''}">
+          <div class="ii-img" ${i.image ? `style="background-image:url('${esc(i.image)}')"` : ''}>${i.image ? '' : (i.kind === 'одежда' ? '👕' : i.kind === 'транспорт' ? '🚗' : '📦')}</div>
+          <div class="grow"><div class="t">${esc(i.name)}</div><div class="s">${i.equipped ? (i.kind === 'одежда' ? 'надето' : i.kind === 'транспорт' ? 'в разъездах' : 'при себе') : 'в шкафу'}${i.descr ? ' · ' + esc(i.descr) : ''}</div></div>
+          ${st.mine ? `
+            <button class="chip ${i.equipped ? 'on' : ''}" data-eq="${i.id}" data-eqv="${i.equipped}">${i.equipped ? 'снять' : 'надеть'}</button>
+            <button class="iconbtn" data-iedit="${i.id}">✏️</button>` : ''}
+        </div>`).join('') || `<div class="hint">Пусто.</div>`}
+      </div>
+      ${st.mine ? `<button class="btn ghost small" id="pp-additem">＋ Добавить</button>` : ''}
+    </div>
+
+    <div class="sect"><h3>Память персонажа</h3>
+      ${st.memory.map((m, i) => `
+        <div class="list-item" style="padding:8px 12px"><div class="grow"><div class="s" style="color:var(--ink)">${esc(m)}</div></div>
+        ${st.mine ? `<button class="iconbtn" data-mdel="${i}">✖</button>` : ''}</div>`).join('') || '<div class="hint">Пока ничего не записано. Это факты, которые персонаж «помнит» — их видит ИИ.</div>'}
+      ${st.mine ? `<div class="row2"><input id="pp-mem" placeholder="напр.: должна Тони услугу"><button class="btn small" id="pp-memadd" style="flex:0 0 auto">＋</button></div>` : ''}
+    </div>
+  `, s => {
+    s.querySelectorAll('[data-ktab]').forEach(b => b.onclick = () => personaProfile(pid, b.dataset.ktab));
+    if (!st.mine) return;
+    s.querySelector('#pp-realism').onchange = async (e) => {
+      await api(`/api/personas/${pid}/needs`, { method: 'PATCH', body: { realism: e.target.checked } });
+      toast(e.target.checked ? 'Реализм включён' : 'Реализм выключен');
+    };
+    s.querySelector('#pp-needs').onclick = () => needsForm(pid, st);
+    s.querySelector('#pp-additem').onclick = () => itemForm(pid, kindTab);
+    s.querySelectorAll('[data-eq]').forEach(b => b.onclick = async () => {
+      await api(`/api/items/${b.dataset.eq}`, { method: 'PATCH', body: { equipped: b.dataset.eqv !== '1' } });
+      personaProfile(pid, kindTab);
+    });
+    s.querySelectorAll('[data-iedit]').forEach(b => b.onclick = () => {
+      itemForm(pid, kindTab, st.items.find(i => i.id === +b.dataset.iedit));
+    });
+    s.querySelectorAll('[data-mdel]').forEach(b => b.onclick = async () => {
+      const mem = st.memory.slice(); mem.splice(+b.dataset.mdel, 1);
+      await api(`/api/personas/${pid}/memory`, { method: 'PATCH', body: { memory: mem } });
+      personaProfile(pid, kindTab);
+    });
+    s.querySelector('#pp-memadd').onclick = async () => {
+      const v = s.querySelector('#pp-mem').value.trim(); if (!v) return;
+      await api(`/api/personas/${pid}/memory`, { method: 'PATCH', body: { memory: [...st.memory, v] } });
+      personaProfile(pid, kindTab);
+    };
+  });
+}
+
+function needsForm(pid, st) {
+  sheet(`
+    <h2>⚙️ Состояние</h2>
+    ${st.need_labels.map(([k, label]) => `
+      <label>${label}: <span id="nv-${k}">${st.needs[k]}</span></label>
+      <input type="range" min="5" max="100" value="${st.needs[k]}" data-need="${k}">`).join('')}
+    <button class="btn" id="nf-save">Сохранить</button>
+  `, s => {
+    s.querySelectorAll('[data-need]').forEach(r => r.oninput = () => {
+      s.querySelector(`#nv-${r.dataset.need}`).textContent = r.value;
+    });
+    s.querySelector('#nf-save').onclick = async () => {
+      const needs = {};
+      s.querySelectorAll('[data-need]').forEach(r => needs[r.dataset.need] = +r.value);
+      await api(`/api/personas/${pid}/needs`, { method: 'PATCH', body: { needs } });
+      personaProfile(pid);
+    };
+  });
+}
+
+function itemForm(pid, kindTab, it) {
+  sheet(`
+    <h2>${it ? 'Предмет' : 'Новый предмет'}</h2>
+    <label>Что это</label>
+    <div class="seg">
+      ${['одежда', 'транспорт', 'вещь'].map(k => `<button data-ik="${k}" class="${(it?.kind || kindTab) === k ? 'on' : ''}">${k}</button>`).join('')}
+    </div>
+    <label>Название</label><input id="if-name" value="${esc(it?.name || '')}" placeholder="чёрное пальто / мотоцикл / фляга">
+    <label>Описание (видит ИИ)</label><input id="if-descr" value="${esc(it?.descr || '')}">
+    <label>Фото</label>
+    ${coverField('if-img', it?.image)}
+    <div class="checkline"><input type="checkbox" id="if-eq" ${it?.equipped ? 'checked' : ''}> <span>Сразу надеть / взять с собой</span></div>
+    <button class="btn" id="if-save">Сохранить</button>
+    ${it ? `<button class="btn danger" id="if-del">🗑 Удалить</button>` : ''}
+  `, s => {
+    bindCoverField(s, 'if-img');
+    let kind = it?.kind || kindTab;
+    s.querySelectorAll('[data-ik]').forEach(b => b.onclick = () => {
+      kind = b.dataset.ik;
+      s.querySelectorAll('[data-ik]').forEach(x => x.classList.toggle('on', x === b));
+    });
+    s.querySelector('#if-save').onclick = async () => {
+      const body = {
+        kind,
+        name: s.querySelector('#if-name').value,
+        descr: s.querySelector('#if-descr').value,
+        image: s.querySelector('#if-img').value,
+        equipped: s.querySelector('#if-eq').checked,
+      };
+      try {
+        if (it) await api(`/api/items/${it.id}`, { method: 'PATCH', body });
+        else await api(`/api/personas/${pid}/items`, { method: 'POST', body });
+        personaProfile(pid, kind);
+      } catch (e) { toast(e.message, true); }
+    };
+    const d = s.querySelector('#if-del');
+    if (d) d.onclick = async () => {
+      if (!confirm('Удалить предмет?')) return;
+      await api(`/api/items/${it.id}`, { method: 'DELETE' });
+      personaProfile(pid, kind);
+    };
+  });
 }
 
 // ----- комната -----
@@ -327,8 +590,8 @@ function renderRoom() {
   const myP = S.my_personas.find(p => p.id === composer.persona_id);
   $app.innerHTML = `
   <div class="topbar">
-    <button class="back" onclick="location.hash='#/world/${r.world_id}'">‹</button>
-    <h1>${r.kind === 'chat' ? '💬' : '📜'} ${esc(r.title)}</h1>
+    <button class="back" onclick="location.hash='#/'">←</button>
+    <h1>${esc(r.title)}</h1>
     <button class="iconbtn" id="b-chron" title="Хроника">📖</button>
   </div>
   <div class="screen ${r.kind === 'chat' ? 'chatmode' : ''}" id="scr">
@@ -346,11 +609,11 @@ function renderRoom() {
       <button class="chip ${myP ? 'on' : ''}" id="c-persona">${myP ? `${myP.emoji} ${esc(myP.name)}` : '💬 вне игры'}</button>
       <button class="chip ${composer.ooc ? 'on' : ''}" id="c-ooc">вне игры</button>
       <button class="chip ai-chip" id="c-ai">✨ позвать ИИ</button>
-      <button class="chip" id="c-img">📎 фото</button>
+      <button class="chip" id="c-img">📎</button>
     </div>
     ${composer.image ? `<div class="img-preview"><img src="${esc(composer.image)}"><button id="c-img-del">✕</button></div>` : ''}
     <div class="composer-row">
-      <textarea id="c-text" rows="1" placeholder="${r.kind === 'chat' ? 'Сообщение…' : 'Твой пост… (*курсив* для действий)'}"></textarea>
+      <textarea id="c-text" rows="1" placeholder="${r.kind === 'chat' ? 'Сообщение…' : 'Продолжить историю…'}"></textarea>
       <button class="send" id="c-send">➤</button>
     </div>
   </div>`;
@@ -370,8 +633,10 @@ function renderRoom() {
   if (more) more.onclick = loadMore;
 
   document.getElementById('feed').addEventListener('click', e => {
-    const btn = e.target.closest('.menu'); if (!btn) return;
-    postMenu(+btn.dataset.id);
+    const menuBtn = e.target.closest('.menu');
+    if (menuBtn) return postMenu(+menuBtn.dataset.id);
+    const avaBtn = e.target.closest('[data-prof]');
+    if (avaBtn) return personaProfile(+avaBtn.dataset.prof);
   });
   scrollFeedDown();
 }
@@ -382,7 +647,7 @@ function postHtml(p) {
   return `
   <div class="post ${a.ai ? 'ai' : ''} ${p.is_ooc ? 'ooc' : ''}" id="post-${p.id}">
     <div class="post-head">
-      ${avaHtml(a)}
+      ${a.pid ? `<button data-prof="${a.pid}" style="display:flex">${avaHtml(a)}</button>` : avaHtml(a)}
       <div>
         <div class="who" style="color:${a.color}">${esc(a.name)}</div>
         <div class="sub">${esc(a.sub)} · ${fmtTime(p.created_at)}${p.edited_at ? ' · ред.' : ''}</div>
@@ -467,16 +732,16 @@ function sheet(html, setup) {
 function closeSheet() { document.querySelector('.overlay')?.remove(); }
 
 function themeSheet() {
-  const cur = localStorage.getItem('tavern_theme') || 'candle';
+  const cur = localStorage.getItem('tavern_theme') || 'wine';
   sheet(`
     <h2>🎨 Тема</h2>
     ${THEMES.map(([id, name]) => `
-      <button class="list-item" data-th="${id}" style="${cur === id ? 'border-color:var(--amber)' : ''}">
+      <button class="list-item" data-th="${id}" style="${cur === id ? 'border-color:var(--amber-soft)' : ''}">
         <div class="grow"><div class="t">${name}</div></div>${cur === id ? '✓' : ''}
       </button>`).join('')}
     <div class="hint">Тема запоминается на этом устройстве.</div>
   `, s => {
-    s.querySelectorAll('[data-th]').forEach(b => b.onclick = () => { applyTheme(b.dataset.th); closeSheet(); });
+    s.querySelectorAll('[data-th]').forEach(b => b.onclick = () => { applyTheme(b.dataset.th); closeSheet(); render(); });
   });
 }
 
@@ -509,12 +774,14 @@ function personasSheet() {
       <div class="list-item">
         ${avaHtml(p)}
         <div class="grow"><div class="t">${esc(p.name)}</div><div class="s">${esc(p.bio)}</div></div>
+        <button class="iconbtn" data-prof2="${p.id}" title="Инвентарь">🎒</button>
         <button class="iconbtn" data-edit="${p.id}">✏️</button>
         <button class="iconbtn" data-del="${p.id}">🗑</button>
       </div>`).join('') || '<div class="hint">Пока нет ни одного. Создай маску, за которую будешь играть.</div>'}
     <button class="btn" id="pe-new">＋ Новый персонаж</button>
   `, s => {
     s.querySelector('#pe-new').onclick = () => personaForm();
+    s.querySelectorAll('[data-prof2]').forEach(b => b.onclick = () => personaProfile(+b.dataset.prof2));
     s.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => personaForm(S.my_personas.find(p => p.id === +b.dataset.edit)));
     s.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
       if (!confirm('Удалить персонажа?')) return;
@@ -530,11 +797,11 @@ function personaForm(p) {
     <label>Имя</label><input id="pf-name" value="${esc(p?.name || '')}">
     <div class="row2">
       <div><label>Эмодзи</label><input id="pf-emoji" value="${esc(p?.emoji || '🎭')}"></div>
-      <div><label>Цвет</label><input id="pf-color" type="color" value="${p?.color || '#c9a227'}" style="height:44px;padding:4px"></div>
+      <div><label>Цвет</label><input id="pf-color" type="color" value="${p?.color || '#9e4a58'}" style="height:44px;padding:4px"></div>
     </div>
     <label>Аватарка</label>
     ${coverField('pf-avatar', p?.avatar)}
-    <label>Кто это (видно всем)</label><textarea id="pf-bio" rows="3">${esc(p?.bio || '')}</textarea>
+    <label>Кто это (видно всем и ИИ)</label><textarea id="pf-bio" rows="3">${esc(p?.bio || '')}</textarea>
     <button class="btn" id="pf-save">Сохранить</button>
   `, s => {
     bindCoverField(s, 'pf-avatar');
@@ -615,7 +882,7 @@ async function renderUsage() {
   const max = Math.max(...u.users.map(x => x.cost), 0.0001);
   $app.innerHTML = `
   <div class="topbar">
-    <button class="back" onclick="history.back()">‹</button>
+    <button class="back" onclick="location.hash='#/'">←</button>
     <h1>💰 Траты за месяц</h1>
   </div>
   <div class="screen pad">
@@ -642,7 +909,7 @@ async function renderLore(worldId) {
   const { lorebooks } = await api(`/api/worlds/${worldId}/lorebooks`);
   $app.innerHTML = `
   <div class="topbar">
-    <button class="back" onclick="location.hash='#/admin'">‹</button>
+    <button class="back" onclick="location.hash='#/admin'">←</button>
     <h1>📚 Лорбуки: ${esc(w?.title || '')}</h1>
   </div>
   <div class="screen pad">
@@ -756,8 +1023,8 @@ async function renderAdmin() {
   const aiFull = (await api('/api/ai-chars')).ai_chars;
   $app.innerHTML = `
   <div class="topbar">
-    <button class="back" onclick="location.hash='#/'">‹</button>
-    <h1>⚙️ Админка</h1>
+    <button class="back" onclick="location.hash='#/'">←</button>
+    <h1>👑 Админка</h1>
   </div>
   <div class="screen pad">
 
@@ -765,7 +1032,7 @@ async function renderAdmin() {
       ${S.worlds.map(w => `
         <div class="list-item">
           <div>${w.emoji}</div>
-          <div class="grow"><div class="t">${esc(w.title)}</div></div>
+          <div class="grow"><div class="t">${esc(w.title)}</div><div class="s">${w.map ? '🗺 карта есть' : 'без карты'}</div></div>
           <button class="btn small ghost" onclick="location.hash='#/lore/${w.id}'">📚 лор</button>
           <button class="iconbtn" data-wedit="${w.id}">✏️</button>
         </div>`).join('')}
@@ -778,7 +1045,7 @@ async function renderAdmin() {
         ${S.rooms.filter(r => r.world_id === w.id).map(r => `
           <div class="list-item">
             <div>${r.kind === 'chat' ? '💬' : '📜'}</div>
-            <div class="grow"><div class="t">${esc(r.title)}</div><div class="s">${esc(r.category)}${r.auto_ai_char_id ? ' · 🤖 авто' : ''}</div></div>
+            <div class="grow"><div class="t">${esc(r.title)}</div><div class="s">${esc(r.category)}${r.auto_ai_char_id ? ' · 🤖 авто' : ''}${r.map_x != null ? ' · 📍' : ''}</div></div>
             <button class="iconbtn" data-redit="${r.id}">✏️</button>
           </div>`).join('')}
       `).join('')}
@@ -830,7 +1097,6 @@ async function renderAdmin() {
       <label>OpenRouter API-ключ ${settings.openrouter_key_set ? '(задан — впиши новый, чтобы сменить)' : '⚠️ не задан'}</label>
       <input id="s-key" type="password" placeholder="sk-or-...">
       <button class="btn" id="s-save" style="margin-top:8px">Сохранить настройки</button>
-      <div class="hint" style="margin-top:6px">Промпт мира теперь у каждого мира свой — в ✏️ мира.</div>
     </div>
   </div>`;
 
@@ -839,8 +1105,8 @@ async function renderAdmin() {
     const { world } = await api(`/api/worlds/${b.dataset.wedit}`);
     worldForm(world);
   });
-  document.getElementById('a-newroom').onclick = () => roomForm();
-  document.querySelectorAll('[data-redit]').forEach(b => b.onclick = () => roomForm(S.rooms.find(r => r.id === +b.dataset.redit)));
+  document.getElementById('a-newroom').onclick = () => roomForm(null, () => renderAdmin());
+  document.querySelectorAll('[data-redit]').forEach(b => b.onclick = () => roomForm(S.rooms.find(r => r.id === +b.dataset.redit), () => renderAdmin()));
   document.getElementById('a-newai').onclick = () => aiForm();
   document.querySelectorAll('[data-aiedit]').forEach(b => b.onclick = () => aiForm(aiFull.find(c => c.id === +b.dataset.aiedit)));
   document.getElementById('a-newext').onclick = () => extForm();
@@ -885,17 +1151,21 @@ function worldForm(w) {
     <label>Эмодзи</label><input id="wf-emoji" value="${esc(w?.emoji || '🌍')}">
     <label>Обложка</label>
     ${coverField('wf-cover', w?.cover)}
+    <label>Карта мира (по ней перемещаются между локациями)</label>
+    ${coverField('wf-map', w?.map)}
     <label>Промпт мира (сеттинг, правила, тон — видят все ИИ этого мира)</label>
     <textarea id="wf-prompt" rows="6">${esc(w?.prompt || '')}</textarea>
     <button class="btn" id="wf-save">Сохранить</button>
     ${w ? `<button class="btn danger" id="wf-arch">📦 В архив</button>` : ''}
   `, s => {
     bindCoverField(s, 'wf-cover');
+    bindCoverField(s, 'wf-map');
     s.querySelector('#wf-save').onclick = async () => {
       const body = {
         title: s.querySelector('#wf-title').value,
         emoji: s.querySelector('#wf-emoji').value || '🌍',
         cover: s.querySelector('#wf-cover').value,
+        map: s.querySelector('#wf-map').value,
         prompt: s.querySelector('#wf-prompt').value,
       };
       try {
@@ -913,7 +1183,7 @@ function worldForm(w) {
   });
 }
 
-function roomForm(r) {
+function roomForm(r, after) {
   const bots = S.ai_chars;
   const attached = r?.ai_ids || [];
   sheet(`
@@ -921,7 +1191,7 @@ function roomForm(r) {
     <label>Название</label><input id="rf-title" value="${esc(r?.title || '')}">
     <div class="row2">
       <div><label>Мир</label>
-        <select id="rf-world">${S.worlds.map(w => `<option value="${w.id}" ${r?.world_id === w.id ? 'selected' : ''}>${w.emoji} ${esc(w.title)}</option>`).join('')}</select></div>
+        <select id="rf-world">${S.worlds.map(w => `<option value="${w.id}" ${(r?.world_id ?? curWorldId) === w.id ? 'selected' : ''}>${w.emoji} ${esc(w.title)}</option>`).join('')}</select></div>
       <div><label>Тип</label>
         <select id="rf-kind">
           <option value="forum" ${r?.kind !== 'chat' ? 'selected' : ''}>📜 Форум (посты)</option>
@@ -958,14 +1228,15 @@ function roomForm(r) {
       try {
         if (r) await api(`/api/rooms/${r.id}`, { method: 'PATCH', body });
         else await api('/api/rooms', { method: 'POST', body });
-        await refreshState(); closeSheet(); renderAdmin();
+        await refreshState(); closeSheet();
+        after ? after() : renderTabs();
       } catch (e) { toast(e.message, true); }
     };
     const a = s.querySelector('#rf-arch');
     if (a) a.onclick = async () => {
       if (!confirm('Убрать комнату в архив? Посты не удалятся.')) return;
       await api(`/api/rooms/${r.id}`, { method: 'PATCH', body: { archived: true } });
-      await refreshState(); closeSheet(); renderAdmin();
+      await refreshState(); closeSheet(); after ? after() : renderTabs();
     };
   });
 }
@@ -976,7 +1247,7 @@ function aiForm(c) {
     <label>Имя</label><input id="af-name" value="${esc(c?.name || '')}" placeholder="Гейммастер / Трактирщик / Наташа">
     <div class="row2">
       <div><label>Эмодзи</label><input id="af-emoji" value="${esc(c?.emoji || '🤖')}"></div>
-      <div><label>Цвет</label><input id="af-color" type="color" value="${c?.color || '#7c5cff'}" style="height:44px;padding:4px"></div>
+      <div><label>Цвет</label><input id="af-color" type="color" value="${c?.color || '#9e4a58'}" style="height:44px;padding:4px"></div>
     </div>
     <label>Аватарка</label>
     ${coverField('af-avatar', c?.avatar)}

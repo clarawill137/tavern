@@ -1,6 +1,7 @@
 'use strict';
 // ai.js — вызовы OpenRouter: посты ИИ-персонажей, лорбуки, сводки летописца, лимиты и учёт трат
 const { q, now, getSetting } = require('./db');
+const { personaStateBlock } = require('./game');
 
 const OR_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const LORE_CHAR_BUDGET = 9000; // максимум символов лора в контексте
@@ -90,6 +91,8 @@ function buildContext(room, aiChar, instruction) {
   parts.push(`# Локация: ${room.title}\n${room.description || '(без описания)'}`);
   if (room.chronicle) parts.push(`# Хроника событий этой локации (краткая сводка прошлого)\n${room.chronicle}`);
   if (lore) parts.push(`# Сведения о мире и персонажах (лорбук)\n${lore}`);
+  const states = personaStateBlock(posts);
+  if (states) parts.push(`# Текущее состояние персонажей игроков (одежда, транспорт, самочувствие, память)\n${states}`);
   if (aiChar) parts.push(`# Твоя роль\n${aiChar.system_prompt}`);
   parts.push(`# Формат\nЭто совместная ролевая игра живых игроков и ИИ. Ниже — последние посты сцены. Ответь ОДНИМ постом от своего лица, по-русски, в стиле сцены. Не пиши действия и реплики за персонажей живых игроков. Не добавляй подпись и заголовок — только текст поста.`);
   if (instruction) parts.push(`# Указание от игрока (вне игры, выполни его)\n${instruction}`);

@@ -116,6 +116,17 @@ CREATE TABLE IF NOT EXISTS lore_entries (
   position INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_lore_book ON lore_entries(book_id);
+CREATE TABLE IF NOT EXISTS items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  persona_id INTEGER NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'вещь',    -- 'одежда' | 'транспорт' | 'вещь'
+  name TEXT NOT NULL,
+  descr TEXT NOT NULL DEFAULT '',
+  image TEXT NOT NULL DEFAULT '',
+  equipped INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_items_persona ON items(persona_id);
 CREATE TABLE IF NOT EXISTS extensions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -152,6 +163,12 @@ addCol('posts', `image TEXT NOT NULL DEFAULT ''`);
 addCol('ai_chars', `world_id INTEGER`);
 addCol('ai_chars', `avatar TEXT NOT NULL DEFAULT ''`);
 addCol('personas', `avatar TEXT NOT NULL DEFAULT ''`);
+addCol('personas', `memory TEXT NOT NULL DEFAULT '[]'`);     // память персонажа (JSON-массив строк)
+addCol('personas', `needs TEXT NOT NULL DEFAULT '{}'`);      // потребности {need:{v,at}}
+addCol('personas', `realism INTEGER NOT NULL DEFAULT 0`);    // симсовский режим: потребности проседают
+addCol('worlds', `map TEXT NOT NULL DEFAULT ''`);            // картинка карты мира
+addCol('rooms', `map_x REAL`);                               // метка на карте, % по ширине
+addCol('rooms', `map_y REAL`);
 
 // дефолтный мир + перенос старого общего промпта мира
 if (db.prepare('SELECT COUNT(*) AS n FROM worlds').get().n === 0) {
@@ -193,19 +210,21 @@ const q = {
   personaById: db.prepare('SELECT * FROM personas WHERE id = ?'),
   insertPersona: db.prepare('INSERT INTO personas(user_id, name, emoji, color, bio, avatar) VALUES (?,?,?,?,?,?)'),
   updatePersona: db.prepare('UPDATE personas SET name=?, emoji=?, color=?, bio=?, avatar=? WHERE id=? AND user_id=?'),
+  setPersonaMemory: db.prepare('UPDATE personas SET memory=? WHERE id=?'),
+  setPersonaNeeds: db.prepare('UPDATE personas SET needs=?, realism=? WHERE id=?'),
   deletePersona: db.prepare('UPDATE personas SET deleted = 1 WHERE id=? AND user_id=?'),
   allPersonas: db.prepare(`SELECT p.*, u.username FROM personas p JOIN users u ON u.id = p.user_id WHERE p.deleted = 0`),
 
   allWorlds: db.prepare('SELECT * FROM worlds WHERE archived = 0 ORDER BY position, id'),
   worldById: db.prepare('SELECT * FROM worlds WHERE id = ?'),
   insertWorld: db.prepare('INSERT INTO worlds(title, emoji, cover, prompt, accent, position) VALUES (?,?,?,?,?,?)'),
-  updateWorld: db.prepare('UPDATE worlds SET title=?, emoji=?, cover=?, prompt=?, accent=?, position=?, archived=? WHERE id=?'),
+  updateWorld: db.prepare('UPDATE worlds SET title=?, emoji=?, cover=?, prompt=?, accent=?, position=?, archived=?, map=? WHERE id=?'),
 
   allRooms: db.prepare('SELECT * FROM rooms WHERE archived = 0 ORDER BY category, position, id'),
   roomsByWorld: db.prepare('SELECT * FROM rooms WHERE world_id = ? AND archived = 0 ORDER BY category, position, id'),
   roomById: db.prepare('SELECT * FROM rooms WHERE id = ?'),
   insertRoom: db.prepare('INSERT INTO rooms(world_id, title, kind, category, description, cover, position) VALUES (?,?,?,?,?,?,?)'),
-  updateRoom: db.prepare(`UPDATE rooms SET title=?, kind=?, category=?, description=?, cover=?, auto_ai_char_id=?, position=?, archived=? WHERE id=?`),
+  updateRoom: db.prepare(`UPDATE rooms SET title=?, kind=?, category=?, description=?, cover=?, auto_ai_char_id=?, position=?, archived=?, map_x=?, map_y=? WHERE id=?`),
   setChronicle: db.prepare('UPDATE rooms SET chronicle=?, chronicle_at=? WHERE id=?'),
 
   roomAi: db.prepare('SELECT ai_char_id FROM room_ai WHERE room_id = ?'),
@@ -221,6 +240,15 @@ const q = {
   postsBefore: db.prepare(`SELECT * FROM posts WHERE room_id = ? AND deleted = 0 AND id < ? ORDER BY id DESC LIMIT ?`),
   lastPostTimes: db.prepare(`SELECT room_id, MAX(created_at) AS last_at, COUNT(*) AS n
                              FROM posts WHERE deleted = 0 GROUP BY room_id`),
+  lastPostPreviews: db.prepare(`SELECT room_id, body, persona_id, ai_char_id FROM posts
+                                WHERE deleted = 0 AND id IN (SELECT MAX(id) FROM posts WHERE deleted = 0 GROUP BY room_id)`),
+
+  itemsByPersona: db.prepare('SELECT * FROM items WHERE persona_id = ? ORDER BY kind, id'),
+  itemById: db.prepare('SELECT * FROM items WHERE id = ?'),
+  insertItem: db.prepare('INSERT INTO items(persona_id, kind, name, descr, image, equipped, created_at) VALUES (?,?,?,?,?,?,?)'),
+  updateItem: db.prepare('UPDATE items SET kind=?, name=?, descr=?, image=?, equipped=? WHERE id=?'),
+  deleteItem: db.prepare('DELETE FROM items WHERE id=?'),
+  equippedByPersona: db.prepare('SELECT * FROM items WHERE persona_id = ? AND equipped = 1 ORDER BY kind, id'),
 
   aiChars: db.prepare('SELECT * FROM ai_chars WHERE deleted = 0 ORDER BY id'),
   aiCharById: db.prepare('SELECT * FROM ai_chars WHERE id = ?'),
