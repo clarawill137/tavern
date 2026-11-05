@@ -1,15 +1,16 @@
 'use strict';
-// ai.js — вызовы OpenRouter: посты ИИ-персонажей, сводки летописца, лимиты и учёт трат
+// ai.js — вызовы OpenRouter: посты ИИ-персонажей, лорбуки, сводки летописца, лимиты и учёт трат
 const { q, now, getSetting } = require('./db');
 
 const OR_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const LORE_CHAR_BUDGET = 9000; // максимум символов лора в контексте
 
 function apiKey() {
   return getSetting('openrouter_key', process.env.OPENROUTER_API_KEY || '');
 }
 
 function dailyLimitFor(user) {
-  if (user.is_admin) return Infinity; // админу лимит не считаем
+  if (user.is_admin) return Infinity;
   if (user.daily_limit_usd != null) return user.daily_limit_usd;
   const def = parseFloat(getSetting('default_daily_limit_usd', '1'));
   return Number.isFinite(def) ? def : 1;
@@ -31,7 +32,6 @@ function checkLimit(user) {
   }
 }
 
-// Рендер поста в текст для контекста модели
 function renderPost(p, names) {
   const who = p.ai_char_id
     ? (names.ai.get(p.ai_char_id) || 'ИИ')
@@ -39,7 +39,8 @@ function renderPost(p, names) {
       ? `${names.personas.get(p.persona_id) || '???'} (игрок ${names.users.get(p.user_id) || '?'})`
       : `${names.users.get(p.user_id) || '???'} [вне игры]`;
   const ooc = p.is_ooc ? ' [вне игры]' : '';
-  return `### ${who}${ooc}\n${p.body}`;
+  const img = p.image ? '\n[к посту приложена картинка]' : '';
+  return `### ${who}${ooc}\n${p.body}${img}`;
 }
 
 function nameMaps() {
@@ -50,16 +51,45 @@ function nameMaps() {
   return { personas, users, ai };
 }
 
+// Лорбуки: constant-записи + записи, чьи ключи встречаются в недавнем тексте
+function loreFor(worldId, scanText) {
+  const entries = q.activeEntriesByWorld.all(worldId);
+  if (!entries.length) return '';
+  const hay = scanText.toLowerCase();
+  const picked = [];
+  let budget = LORE_CHAR_BUDGET;
+  for (const e of entries) {
+    let hit = !!e.always_on;
+    if (!hit && e.keys) {
+      for (const k of e.keys.split(',')) {
+        const key = k.trim().toLowerCase();
+        if (key && hay.includes(key)) { hit = true; break; }
+      }
+    }
+    if (hit && e.content.length <= budget) {
+      picked.push(e.title ? `[${e.title}]\n${e.content}` : e.content);
+      budget -= e.content.length;
+    }
+  }
+  return picked.join('\n\n');
+}
+
 function buildContext(room, aiChar, instruction) {
   const names = nameMaps();
+  const world = q.worldById.get(room.world_id);
   const posts = q.lastPosts.all(room.id, aiChar ? aiChar.context_posts : 60).reverse();
   const history = posts.map(p => renderPost(p, names)).join('\n\n');
 
+  // лор сканируем по последним ~15 постам + описанию комнаты + указанию
+  const scanText = [room.title, room.description, instruction || '',
+    ...posts.slice(-15).map(p => p.body)].join('\n');
+  const lore = world ? loreFor(world.id, scanText) : '';
+
   const parts = [];
-  const world = getSetting('world_prompt', '');
-  if (world) parts.push(`# Мир и правила игры\n${world}`);
+  if (world && world.prompt) parts.push(`# Мир и правила игры: ${world.title}\n${world.prompt}`);
   parts.push(`# Локация: ${room.title}\n${room.description || '(без описания)'}`);
   if (room.chronicle) parts.push(`# Хроника событий этой локации (краткая сводка прошлого)\n${room.chronicle}`);
+  if (lore) parts.push(`# Сведения о мире и персонажах (лорбук)\n${lore}`);
   if (aiChar) parts.push(`# Твоя роль\n${aiChar.system_prompt}`);
   parts.push(`# Формат\nЭто совместная ролевая игра живых игроков и ИИ. Ниже — последние посты сцены. Ответь ОДНИМ постом от своего лица, по-русски, в стиле сцены. Не пиши действия и реплики за персонажей живых игроков. Не добавляй подпись и заголовок — только текст поста.`);
   if (instruction) parts.push(`# Указание от игрока (вне игры, выполни его)\n${instruction}`);
@@ -103,7 +133,6 @@ function logUsage(user, aiCharId, roomId, model, r, kind) {
   q.insertUsage.run(user.id, aiCharId, roomId, model, r.prompt_tokens, r.completion_tokens, r.cost_usd, kind, now());
 }
 
-// ИИ-персонаж пишет пост в комнату (от имени вызвавшего юзера считаются траты)
 async function aiPost({ user, room, aiChar, instruction }) {
   checkLimit(user);
   const { system, history } = buildContext(room, aiChar, instruction);
@@ -118,7 +147,6 @@ async function aiPost({ user, room, aiChar, instruction }) {
   return r.text;
 }
 
-// Летописец: сводка/хронология комнаты
 async function chronicle({ user, room }) {
   checkLimit(user);
   const model = getSetting('chronicle_model', 'anthropic/claude-haiku-5.5');

@@ -2,11 +2,24 @@
 /* Таверна — фронт без фреймворков */
 
 const $app = document.getElementById('app');
-let S = null;            // state с сервера
-let curRoom = null;      // открытая комната
-let posts = [];          // посты открытой комнаты
-let composer = { persona_id: null, ooc: false };
+let S = null;
+let curRoom = null;
+let curWorld = null;
+let posts = [];
+let composer = { persona_id: null, ooc: false, image: '' };
 let sse = null;
+let extLoaded = false;
+
+// ---------- темы ----------
+const THEMES = [
+  ['candle', 'Свечная'], ['parchment', 'Пергамент'], ['midnight', 'Полночь'],
+  ['grove', 'Роща'], ['noir', 'Нуар'],
+];
+function applyTheme(t) {
+  document.body.dataset.theme = t;
+  localStorage.setItem('tavern_theme', t);
+}
+applyTheme(localStorage.getItem('tavern_theme') || 'candle');
 
 // ---------- utils ----------
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -19,6 +32,9 @@ const fmtTime = ts => {
   return d.toLocaleDateString('ru', { day: 'numeric', month: 'short' }) + ' ' + hm;
 };
 const money = v => '$' + (v || 0).toFixed(v >= 1 ? 2 : 3);
+const avaHtml = (a) => a.avatar
+  ? `<div class="ava" style="border-color:${a.color};background-image:url('${esc(a.avatar)}')"></div>`
+  : `<div class="ava" style="border-color:${a.color}">${a.emoji}</div>`;
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -35,26 +51,87 @@ function toast(text, bad = false) {
   const t = document.createElement('div');
   t.textContent = text;
   t.style.cssText = `position:fixed;left:50%;transform:translateX(-50%);bottom:90px;z-index:99;
-    background:${bad ? '#4a2a26' : '#2d241d'};color:${bad ? '#e8b1aa' : '#e8ddcb'};
-    padding:10px 16px;border-radius:12px;font-size:14px;max-width:86vw;border:1px solid #3a2f25;text-align:center`;
+    background:${bad ? 'var(--bad-bg)' : 'var(--panel2)'};color:${bad ? 'var(--bad-ink)' : 'var(--ink)'};
+    padding:10px 16px;border-radius:12px;font-size:14px;max-width:86vw;border:1px solid var(--line);text-align:center`;
   document.body.appendChild(t);
   setTimeout(() => t.remove(), bad ? 5000 : 2500);
+}
+
+// ---------- загрузка картинок (с сжатием на телефоне) ----------
+function pickImage(cb) {
+  const inp = document.createElement('input');
+  inp.type = 'file'; inp.accept = 'image/*';
+  inp.onchange = () => {
+    const f = inp.files[0]; if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = async () => {
+        const MAX = 1600;
+        const k = Math.min(1, MAX / Math.max(img.width, img.height));
+        const cv = document.createElement('canvas');
+        cv.width = Math.round(img.width * k); cv.height = Math.round(img.height * k);
+        cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+        try {
+          const r = await api('/api/upload', { method: 'POST', body: { data: cv.toDataURL('image/jpeg', 0.85) } });
+          cb(r.url);
+        } catch (e) { toast(e.message, true); }
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(f);
+  };
+  inp.click();
+}
+
+// кнопка-поле «обложка» для форм
+function coverField(id, current) {
+  return `<div class="row2" style="align-items:center">
+    <button type="button" class="btn ghost small" id="${id}-btn">🖼 ${current ? 'Сменить картинку' : 'Загрузить картинку'}</button>
+    <button type="button" class="btn ghost small" id="${id}-clear" ${current ? '' : 'style="display:none"'}>✖ Убрать</button>
+  </div>
+  <input type="hidden" id="${id}" value="${esc(current || '')}">`;
+}
+function bindCoverField(s, id) {
+  s.querySelector(`#${id}-btn`).onclick = () => pickImage(url => {
+    s.querySelector(`#${id}`).value = url;
+    s.querySelector(`#${id}-btn`).textContent = '🖼 Сменить картинку';
+    s.querySelector(`#${id}-clear`).style.display = '';
+    toast('Картинка загружена');
+  });
+  s.querySelector(`#${id}-clear`).onclick = () => {
+    s.querySelector(`#${id}`).value = '';
+    s.querySelector(`#${id}-clear`).style.display = 'none';
+    s.querySelector(`#${id}-btn`).textContent = '🖼 Загрузить картинку';
+  };
+}
+
+// ---------- расширения ----------
+function loadExtensions() {
+  if (extLoaded || !S) return;
+  extLoaded = true;
+  for (const x of S.extensions || []) {
+    try {
+      if (x.css) { const st = document.createElement('style'); st.textContent = x.css; document.head.appendChild(st); }
+      if (x.js) new Function('Tavern', x.js)({ api, toast, sheet, closeSheet, state: () => S });
+    } catch (e) { console.error('Расширение', x.name, e); }
+  }
 }
 
 // ---------- авторы постов ----------
 function author(p) {
   if (p.ai_char_id) {
     const c = S.ai_chars.find(c => c.id === p.ai_char_id);
-    return { name: c ? c.name : 'ИИ', sub: 'ИИ', emoji: c?.emoji || '🤖', color: c?.color || '#9d7bff', ai: true };
+    return { name: c ? c.name : 'ИИ', sub: 'ИИ', emoji: c?.emoji || '🤖', color: c?.color || '#9d7bff', avatar: c?.avatar || '', ai: true };
   }
   if (p.persona_id) {
     const pe = S.all_personas.find(x => x.id === p.persona_id);
     return pe
-      ? { name: pe.name, sub: 'игрок: ' + pe.username, emoji: pe.emoji, color: pe.color }
-      : { name: '???', sub: '', emoji: '🎭', color: '#777' };
+      ? { name: pe.name, sub: 'игрок: ' + pe.username, emoji: pe.emoji, color: pe.color, avatar: pe.avatar || '' }
+      : { name: '???', sub: '', emoji: '🎭', color: '#777', avatar: '' };
   }
   const u = S.users.find(u => u.id === p.user_id);
-  return { name: u ? u.username : '???', sub: 'вне игры', emoji: '💬', color: '#8a8a8a' };
+  return { name: u ? u.username : '???', sub: 'вне игры', emoji: '💬', color: '#8a8a8a', avatar: '' };
 }
 
 // ---------- SSE ----------
@@ -81,7 +158,9 @@ function connectSSE() {
         const c = S.ai_chars.find(c => c.id === ev.ai_char_id);
         el.textContent = ev.on ? `${c?.emoji || '🤖'} ${c?.name || 'ИИ'} пишет…` : '';
       }
-    } else if (['rooms', 'personas', 'ai_chars', 'chronicle'].includes(ev.type)) {
+    } else if (ev.type === 'ai_error') {
+      if (curRoom && ev.room_id === curRoom.id) toast('ИИ: ' + ev.message, true);
+    } else if (['rooms', 'personas', 'ai_chars', 'chronicle', 'extensions'].includes(ev.type)) {
       refreshState().then(() => { if (!document.querySelector('.overlay')) render(); });
     }
   };
@@ -91,19 +170,26 @@ async function refreshState() {
   S = await api('/api/state');
   if (!composer.persona_id && S.my_personas[0]) composer.persona_id = S.my_personas[0].id;
   if (composer.persona_id && !S.my_personas.find(p => p.id === composer.persona_id)) composer.persona_id = null;
+  loadExtensions();
 }
 
 // ---------- роутинг ----------
 window.addEventListener('hashchange', () => route());
 async function route() {
   const h = location.hash || '#/';
-  const m = h.match(/^#\/room\/(\d+)/);
-  if (m && S) {
-    curRoom = S.rooms.find(r => r.id === +m[1]) || null;
-    if (curRoom) {
-      posts = (await api(`/api/rooms/${curRoom.id}/posts?limit=50`)).posts;
+  let m;
+  curRoom = null; curWorld = null;
+  if (S) {
+    if ((m = h.match(/^#\/room\/(\d+)/))) {
+      curRoom = S.rooms.find(r => r.id === +m[1]) || null;
+      if (curRoom) {
+        curWorld = S.worlds.find(w => w.id === curRoom.world_id) || null;
+        posts = (await api(`/api/rooms/${curRoom.id}/posts?limit=50`)).posts;
+      }
+    } else if ((m = h.match(/^#\/world\/(\d+)/))) {
+      curWorld = S.worlds.find(w => w.id === +m[1]) || null;
     }
-  } else curRoom = null;
+  }
   render();
   if (curRoom) scrollFeedDown();
 }
@@ -122,6 +208,9 @@ function render() {
   if (curRoom) return renderRoom();
   if (h === '#/usage') return renderUsage();
   if (h === '#/admin') return renderAdmin();
+  let m;
+  if ((m = h.match(/^#\/lore\/(\d+)/))) return renderLore(+m[1]);
+  if (curWorld) return renderWorld();
   renderHome();
 }
 
@@ -161,23 +250,65 @@ function renderLogin(mode = 'login') {
   };
 }
 
-// ----- главная -----
+// ----- главная: миры -----
 function renderHome() {
-  const cats = {};
-  for (const r of S.rooms) (cats[r.category] ||= []).push(r);
+  if (S.worlds.length === 1) { location.hash = `#/world/${S.worlds[0].id}`; return; }
   $app.innerHTML = `
   <div class="topbar">
     <h1>🕯️ ${esc(S.app_title)}</h1>
+    <button class="iconbtn" id="b-theme" title="Тема">🎨</button>
     <button class="iconbtn" id="b-personas" title="Мои персонажи">🎭</button>
     <button class="iconbtn" onclick="location.hash='#/usage'" title="Траты">💰</button>
     ${S.me.is_admin ? `<button class="iconbtn" onclick="location.hash='#/admin'" title="Админка">⚙️</button>` : ''}
     <button class="iconbtn" id="b-logout" title="Выйти">🚪</button>
   </div>
   <div class="screen pad">
-    ${Object.entries(cats).map(([cat, rooms]) => `
+    ${S.worlds.map(w => worldCardHtml(w)).join('') ||
+      `<div class="hint" style="margin-top:30vh;text-align:center">Миров пока нет.${S.me.is_admin ? '<br>Создай первый в ⚙️ админке.' : ''}</div>`}
+  </div>`;
+  bindHomeButtons();
+}
+function worldCardHtml(w) {
+  const rooms = S.rooms.filter(r => r.world_id === w.id);
+  return `
+  <button class="world-card ${w.cover ? '' : 'nocover'}" ${w.cover ? `style="background-image:url('${esc(w.cover)}')"` : ''}
+    onclick="location.hash='#/world/${w.id}'">
+    <div class="wshade">
+      <div class="wt">${w.emoji} ${esc(w.title)}</div>
+      <div class="ws">${rooms.length} комнат</div>
+    </div>
+  </button>`;
+}
+function bindHomeButtons() {
+  const t = document.getElementById('b-theme'); if (t) t.onclick = themeSheet;
+  const p = document.getElementById('b-personas'); if (p) p.onclick = personasSheet;
+  const l = document.getElementById('b-logout');
+  if (l) l.onclick = async () => { await api('/api/logout', { method: 'POST' }); S = null; location.hash = ''; render(); };
+}
+
+// ----- мир: комнаты -----
+function renderWorld() {
+  const w = curWorld;
+  const rooms = S.rooms.filter(r => r.world_id === w.id);
+  const cats = {};
+  for (const r of rooms) (cats[r.category] ||= []).push(r);
+  const multi = S.worlds.length > 1;
+  $app.innerHTML = `
+  <div class="topbar">
+    ${multi ? `<button class="back" onclick="location.hash='#/'">‹</button>` : ''}
+    <h1>${w.emoji} ${esc(w.title)}</h1>
+    <button class="iconbtn" id="b-theme" title="Тема">🎨</button>
+    <button class="iconbtn" id="b-personas" title="Мои персонажи">🎭</button>
+    <button class="iconbtn" onclick="location.hash='#/usage'" title="Траты">💰</button>
+    ${S.me.is_admin ? `<button class="iconbtn" onclick="location.hash='#/admin'" title="Админка">⚙️</button>` : ''}
+    ${multi ? '' : `<button class="iconbtn" id="b-logout" title="Выйти">🚪</button>`}
+  </div>
+  <div class="screen pad">
+    ${Object.entries(cats).map(([cat, list]) => `
       <div class="cat-label">${esc(cat)}</div>
-      ${rooms.map(r => `
-        <button class="room-card" onclick="location.hash='#/room/${r.id}'">
+      ${list.map(r => `
+        <button class="room-card ${r.cover ? 'covered' : ''}" ${r.cover ? `style="background-image:url('${esc(r.cover)}')"` : ''}
+          onclick="location.hash='#/room/${r.id}'">
           <div class="ric">${r.kind === 'chat' ? '💬' : '📜'}</div>
           <div>
             <div class="rt">${esc(r.title)}</div>
@@ -187,8 +318,7 @@ function renderHome() {
         </button>`).join('')}
     `).join('') || `<div class="hint" style="margin-top:30vh;text-align:center">Комнат пока нет.${S.me.is_admin ? '<br>Создай первую в ⚙️ админке.' : ' Жди админа.'}</div>`}
   </div>`;
-  document.getElementById('b-personas').onclick = personasSheet;
-  document.getElementById('b-logout').onclick = async () => { await api('/api/logout', { method: 'POST' }); S = null; location.hash = ''; render(); };
+  bindHomeButtons();
 }
 
 // ----- комната -----
@@ -197,11 +327,13 @@ function renderRoom() {
   const myP = S.my_personas.find(p => p.id === composer.persona_id);
   $app.innerHTML = `
   <div class="topbar">
-    <button class="back" onclick="location.hash='#/'">‹</button>
+    <button class="back" onclick="location.hash='#/world/${r.world_id}'">‹</button>
     <h1>${r.kind === 'chat' ? '💬' : '📜'} ${esc(r.title)}</h1>
     <button class="iconbtn" id="b-chron" title="Хроника">📖</button>
   </div>
   <div class="screen ${r.kind === 'chat' ? 'chatmode' : ''}" id="scr">
+    ${r.cover ? `<div class="room-cover" style="background-image:url('${esc(r.cover)}')">
+      <div class="rc-shade"><h2>${esc(r.title)}</h2></div></div>` : ''}
     ${r.description ? `<div class="chronicle-box" style="margin-bottom:0"><div class="ch-title">Локация</div>${esc(r.description)}</div>` : ''}
     <div class="feed" id="feed">
       ${posts.length >= 50 ? `<button class="loadmore" id="b-more">↑ показать раньше</button>` : ''}
@@ -210,11 +342,13 @@ function renderRoom() {
     <div class="typing" id="typing"></div>
   </div>
   <div class="composer">
-    <div class="composer-tools">
+    <div class="composer-tools" id="ctools">
       <button class="chip ${myP ? 'on' : ''}" id="c-persona">${myP ? `${myP.emoji} ${esc(myP.name)}` : '💬 вне игры'}</button>
       <button class="chip ${composer.ooc ? 'on' : ''}" id="c-ooc">вне игры</button>
       <button class="chip ai-chip" id="c-ai">✨ позвать ИИ</button>
+      <button class="chip" id="c-img">📎 фото</button>
     </div>
+    ${composer.image ? `<div class="img-preview"><img src="${esc(composer.image)}"><button id="c-img-del">✕</button></div>` : ''}
     <div class="composer-row">
       <textarea id="c-text" rows="1" placeholder="${r.kind === 'chat' ? 'Сообщение…' : 'Твой пост… (*курсив* для действий)'}"></textarea>
       <button class="send" id="c-send">➤</button>
@@ -228,6 +362,9 @@ function renderRoom() {
   document.getElementById('c-ooc').onclick = () => { composer.ooc = !composer.ooc; renderRoom(); };
   document.getElementById('c-persona').onclick = pickPersonaSheet;
   document.getElementById('c-ai').onclick = aiSheet;
+  document.getElementById('c-img').onclick = () => pickImage(url => { composer.image = url; renderRoom(); });
+  const del = document.getElementById('c-img-del');
+  if (del) del.onclick = () => { composer.image = ''; renderRoom(); };
   document.getElementById('b-chron').onclick = chronicleSheet;
   const more = document.getElementById('b-more');
   if (more) more.onclick = loadMore;
@@ -245,14 +382,15 @@ function postHtml(p) {
   return `
   <div class="post ${a.ai ? 'ai' : ''} ${p.is_ooc ? 'ooc' : ''}" id="post-${p.id}">
     <div class="post-head">
-      <div class="ava" style="border-color:${a.color}">${a.emoji}</div>
+      ${avaHtml(a)}
       <div>
         <div class="who" style="color:${a.color}">${esc(a.name)}</div>
         <div class="sub">${esc(a.sub)} · ${fmtTime(p.created_at)}${p.edited_at ? ' · ред.' : ''}</div>
       </div>
       ${(mine || S.me.is_admin) ? `<button class="menu" data-id="${p.id}">⋯</button>` : ''}
     </div>
-    <div class="post-body">${fmtBody(p.body)}</div>
+    ${p.body ? `<div class="post-body">${fmtBody(p.body)}</div>` : ''}
+    ${p.image ? `<img class="post-img" src="${esc(p.image)}" loading="lazy">` : ''}
   </div>`;
 }
 
@@ -274,13 +412,15 @@ async function loadMore() {
 async function sendPost() {
   const ta = document.getElementById('c-text');
   const body = ta.value.trim();
-  if (!body) return;
+  if (!body && !composer.image) return;
   const btn = document.getElementById('c-send'); btn.disabled = true;
   try {
     await api(`/api/rooms/${curRoom.id}/posts`, { method: 'POST', body: {
-      body, persona_id: composer.ooc ? null : composer.persona_id, is_ooc: composer.ooc,
+      body, image: composer.image || '',
+      persona_id: composer.ooc ? null : composer.persona_id, is_ooc: composer.ooc,
     }});
     ta.value = ''; ta.style.height = 'auto';
+    if (composer.image) { composer.image = ''; renderRoom(); }
   } catch (e) { toast(e.message, true); }
   btn.disabled = false;
 }
@@ -289,10 +429,11 @@ function postMenu(id) {
   const p = posts.find(x => x.id === id); if (!p) return;
   sheet(`
     <h2>Пост</h2>
-    <button class="btn ghost" id="pm-edit">✏️ Редактировать</button>
+    ${p.body ? `<button class="btn ghost" id="pm-edit">✏️ Редактировать</button>` : ''}
     <button class="btn danger" id="pm-del">🗑 Удалить</button>
   `, s => {
-    s.querySelector('#pm-edit').onclick = () => {
+    const e = s.querySelector('#pm-edit');
+    if (e) e.onclick = () => {
       closeSheet();
       sheet(`
         <h2>Редактирование</h2>
@@ -325,6 +466,20 @@ function sheet(html, setup) {
 }
 function closeSheet() { document.querySelector('.overlay')?.remove(); }
 
+function themeSheet() {
+  const cur = localStorage.getItem('tavern_theme') || 'candle';
+  sheet(`
+    <h2>🎨 Тема</h2>
+    ${THEMES.map(([id, name]) => `
+      <button class="list-item" data-th="${id}" style="${cur === id ? 'border-color:var(--amber)' : ''}">
+        <div class="grow"><div class="t">${name}</div></div>${cur === id ? '✓' : ''}
+      </button>`).join('')}
+    <div class="hint">Тема запоминается на этом устройстве.</div>
+  `, s => {
+    s.querySelectorAll('[data-th]').forEach(b => b.onclick = () => { applyTheme(b.dataset.th); closeSheet(); });
+  });
+}
+
 function pickPersonaSheet() {
   sheet(`
     <h2>От чьего лица пишем?</h2>
@@ -333,7 +488,7 @@ function pickPersonaSheet() {
     </button>
     ${S.my_personas.map(p => `
       <button class="list-item" data-pid="${p.id}">
-        <div class="ava" style="border-color:${p.color}">${p.emoji}</div>
+        ${avaHtml(p)}
         <div class="grow"><div class="t">${esc(p.name)}</div><div class="s">${esc(p.bio)}</div></div>
       </button>`).join('')}
     <button class="btn ghost" id="pp-manage">🎭 Мои персонажи…</button>
@@ -352,7 +507,7 @@ function personasSheet() {
     <h2>Мои персонажи</h2>
     ${S.my_personas.map(p => `
       <div class="list-item">
-        <div class="ava" style="border-color:${p.color}">${p.emoji}</div>
+        ${avaHtml(p)}
         <div class="grow"><div class="t">${esc(p.name)}</div><div class="s">${esc(p.bio)}</div></div>
         <button class="iconbtn" data-edit="${p.id}">✏️</button>
         <button class="iconbtn" data-del="${p.id}">🗑</button>
@@ -377,14 +532,18 @@ function personaForm(p) {
       <div><label>Эмодзи</label><input id="pf-emoji" value="${esc(p?.emoji || '🎭')}"></div>
       <div><label>Цвет</label><input id="pf-color" type="color" value="${p?.color || '#c9a227'}" style="height:44px;padding:4px"></div>
     </div>
+    <label>Аватарка</label>
+    ${coverField('pf-avatar', p?.avatar)}
     <label>Кто это (видно всем)</label><textarea id="pf-bio" rows="3">${esc(p?.bio || '')}</textarea>
     <button class="btn" id="pf-save">Сохранить</button>
   `, s => {
+    bindCoverField(s, 'pf-avatar');
     s.querySelector('#pf-save').onclick = async () => {
       const body = {
         name: s.querySelector('#pf-name').value,
         emoji: s.querySelector('#pf-emoji').value || '🎭',
         color: s.querySelector('#pf-color').value,
+        avatar: s.querySelector('#pf-avatar').value,
         bio: s.querySelector('#pf-bio').value,
       };
       try {
@@ -397,15 +556,23 @@ function personaForm(p) {
 }
 
 // ----- вызов ИИ -----
+function roomAiChars() {
+  const attached = (curRoom.ai_ids || []).map(id => S.ai_chars.find(c => c.id === id)).filter(Boolean);
+  const rest = S.ai_chars.filter(c => (!c.world_id || c.world_id === curRoom.world_id) && !attached.find(a => a.id === c.id));
+  return { attached, rest };
+}
 function aiSheet() {
-  if (!S.ai_chars.length) return toast(S.me.is_admin ? 'Сначала создай ИИ-персонажей в админке' : 'Админ ещё не завёл ИИ-персонажей', true);
+  const { attached, rest } = roomAiChars();
+  if (!attached.length && !rest.length) return toast(S.me.is_admin ? 'Сначала создай ИИ-персонажей в админке' : 'Админ ещё не завёл ИИ-персонажей', true);
+  const item = c => `
+    <button class="list-item" data-ai="${c.id}">
+      ${avaHtml(c)}
+      <div class="grow"><div class="t">${esc(c.name)}</div><div class="s">${esc(c.model)}</div></div>
+    </button>`;
   sheet(`
     <h2>✨ Позвать ИИ</h2>
-    ${S.ai_chars.map(c => `
-      <button class="list-item" data-ai="${c.id}">
-        <div class="ava" style="border-color:${c.color}">${c.emoji}</div>
-        <div class="grow"><div class="t">${esc(c.name)}</div><div class="s">${esc(c.model)}</div></div>
-      </button>`).join('')}
+    ${attached.length ? `<div class="hint">В этой комнате:</div>${attached.map(item).join('')}` : ''}
+    ${rest.length ? `${attached.length ? '<div class="hint">Остальные:</div>' : ''}${rest.map(item).join('')}` : ''}
     <label>Указание (необязательно — «вне игры» просьба к ИИ)</label>
     <textarea id="ai-instr" rows="2" placeholder="напр.: пусть в таверну вбежит гонец с плохими вестями"></textarea>
     <div class="hint">Потрачено сегодня: ${money(S.spent_today)}${S.daily_limit != null ? ` из ${money(S.daily_limit)}` : ''}</div>
@@ -448,7 +615,7 @@ async function renderUsage() {
   const max = Math.max(...u.users.map(x => x.cost), 0.0001);
   $app.innerHTML = `
   <div class="topbar">
-    <button class="back" onclick="location.hash='#/'">‹</button>
+    <button class="back" onclick="history.back()">‹</button>
     <h1>💰 Траты за месяц</h1>
   </div>
   <div class="screen pad">
@@ -469,9 +636,123 @@ async function renderUsage() {
   </div>`;
 }
 
+// ----- лорбуки -----
+async function renderLore(worldId) {
+  const w = S.worlds.find(x => x.id === worldId);
+  const { lorebooks } = await api(`/api/worlds/${worldId}/lorebooks`);
+  $app.innerHTML = `
+  <div class="topbar">
+    <button class="back" onclick="location.hash='#/admin'">‹</button>
+    <h1>📚 Лорбуки: ${esc(w?.title || '')}</h1>
+  </div>
+  <div class="screen pad">
+    ${lorebooks.map(b => `
+      <div class="sect">
+        <div class="list-item">
+          <div class="grow"><div class="t">${esc(b.name)}</div><div class="s">${b.entries.length} записей</div></div>
+          <button class="chip ${b.enabled ? 'on' : ''}" data-btoggle="${b.id}">${b.enabled ? 'вкл' : 'выкл'}</button>
+          <button class="iconbtn" data-bimport="${b.id}" title="Импорт ST JSON">📥</button>
+          <button class="iconbtn" data-bdel="${b.id}">🗑</button>
+        </div>
+        ${b.entries.map(e => `
+          <div class="list-item" style="margin-left:12px">
+            <div class="grow">
+              <div class="t" style="font-size:14px">${esc(e.title || e.keys || '(без названия)')} ${e.always_on ? '📌' : ''}</div>
+              <div class="s">${esc(e.keys)}</div>
+            </div>
+            <button class="chip ${e.enabled ? 'on' : ''}" data-etoggle="${e.id}" data-eval="${e.enabled}">${e.enabled ? 'вкл' : 'выкл'}</button>
+            <button class="iconbtn" data-eedit="${e.id}" data-ebook="${b.id}">✏️</button>
+          </div>`).join('')}
+        <button class="btn ghost small" data-eadd="${b.id}">＋ Запись</button>
+      </div>`).join('') || '<div class="hint" style="margin-top:20px">Лорбуков нет. Создай и импортни свои из SillyTavern (World Info JSON).</div>'}
+    <div class="sect">
+      <button class="btn" id="lb-new">＋ Новый лорбук</button>
+      <div class="hint" style="margin-top:8px">📥 — импорт файла World Info из ST (тот же JSON, что экспортируешь из таверны). 📌 — запись подаётся всегда, остальные — когда ключи мелькают в последних постах.</div>
+    </div>
+  </div>`;
+
+  document.getElementById('lb-new').onclick = async () => {
+    const name = prompt('Название лорбука:'); if (!name) return;
+    await api(`/api/worlds/${worldId}/lorebooks`, { method: 'POST', body: { name } });
+    renderLore(worldId);
+  };
+  document.querySelectorAll('[data-btoggle]').forEach(b => b.onclick = async () => {
+    const book = lorebooks.find(x => x.id === +b.dataset.btoggle);
+    await api(`/api/lorebooks/${book.id}`, { method: 'PATCH', body: { enabled: !book.enabled } });
+    renderLore(worldId);
+  });
+  document.querySelectorAll('[data-bdel]').forEach(b => b.onclick = async () => {
+    if (!confirm('Удалить лорбук со всеми записями?')) return;
+    await api(`/api/lorebooks/${b.dataset.bdel}`, { method: 'DELETE' });
+    renderLore(worldId);
+  });
+  document.querySelectorAll('[data-bimport]').forEach(b => b.onclick = () => {
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = '.json,application/json';
+    inp.onchange = () => {
+      const f = inp.files[0]; if (!f) return;
+      const reader = new FileReader();
+      reader.onload = async () => {
+        try {
+          const r = await api(`/api/lorebooks/${b.dataset.bimport}/import`, { method: 'POST', body: { json: reader.result, replace: confirm('Заменить существующие записи? (Отмена = добавить к ним)') } });
+          toast(`Импортировано записей: ${r.imported}`);
+          renderLore(worldId);
+        } catch (e) { toast(e.message, true); }
+      };
+      reader.readAsText(f);
+    };
+    inp.click();
+  });
+  document.querySelectorAll('[data-etoggle]').forEach(b => b.onclick = async () => {
+    await api(`/api/lore-entries/${b.dataset.etoggle}`, { method: 'PATCH', body: { enabled: b.dataset.eval !== '1' } });
+    renderLore(worldId);
+  });
+  document.querySelectorAll('[data-eadd]').forEach(b => b.onclick = () => loreEntryForm(worldId, +b.dataset.eadd));
+  document.querySelectorAll('[data-eedit]').forEach(b => {
+    b.onclick = () => {
+      const book = lorebooks.find(x => x.id === +b.dataset.ebook);
+      loreEntryForm(worldId, book.id, book.entries.find(e => e.id === +b.dataset.eedit));
+    };
+  });
+}
+
+function loreEntryForm(worldId, bookId, e) {
+  sheet(`
+    <h2>${e ? 'Запись' : 'Новая запись'}</h2>
+    <label>Название (для себя)</label><input id="le-title" value="${esc(e?.title || '')}">
+    <label>Ключи через запятую (при каких словах подавать)</label><input id="le-keys" value="${esc(e?.keys || '')}" placeholder="Хеди, Барлоу, лаборатория">
+    <label>Текст (попадает в контекст ИИ)</label><textarea id="le-content" rows="7">${esc(e?.content || '')}</textarea>
+    <div class="checkline"><input type="checkbox" id="le-always" ${e?.always_on ? 'checked' : ''}> <span>📌 Подавать всегда (constant)</span></div>
+    <button class="btn" id="le-save">Сохранить</button>
+    ${e ? `<button class="btn danger" id="le-del">🗑 Удалить</button>` : ''}
+  `, s => {
+    s.querySelector('#le-save').onclick = async () => {
+      const body = {
+        title: s.querySelector('#le-title').value,
+        keys: s.querySelector('#le-keys').value,
+        content: s.querySelector('#le-content').value,
+        always_on: s.querySelector('#le-always').checked,
+      };
+      try {
+        if (e) await api(`/api/lore-entries/${e.id}`, { method: 'PATCH', body });
+        else await api(`/api/lorebooks/${bookId}/entries`, { method: 'POST', body });
+        closeSheet(); renderLore(worldId);
+      } catch (er) { toast(er.message, true); }
+    };
+    const d = s.querySelector('#le-del');
+    if (d) d.onclick = async () => {
+      if (!confirm('Удалить запись?')) return;
+      await api(`/api/lore-entries/${e.id}`, { method: 'DELETE' });
+      closeSheet(); renderLore(worldId);
+    };
+  });
+}
+
 // ----- админка -----
 async function renderAdmin() {
-  const [settings, invites] = await Promise.all([api('/api/settings'), api('/api/invites')]);
+  const [settings, invites, extAll] = await Promise.all([
+    api('/api/settings'), api('/api/invites'), api('/api/extensions'),
+  ]);
   const aiFull = (await api('/api/ai-chars')).ai_chars;
   $app.innerHTML = `
   <div class="topbar">
@@ -480,24 +761,49 @@ async function renderAdmin() {
   </div>
   <div class="screen pad">
 
-    <div class="sect"><h3>Комнаты</h3>
-      ${S.rooms.map(r => `
+    <div class="sect"><h3>Миры</h3>
+      ${S.worlds.map(w => `
         <div class="list-item">
-          <div>${r.kind === 'chat' ? '💬' : '📜'}</div>
-          <div class="grow"><div class="t">${esc(r.title)}</div><div class="s">${esc(r.category)}</div></div>
-          <button class="iconbtn" data-redit="${r.id}">✏️</button>
+          <div>${w.emoji}</div>
+          <div class="grow"><div class="t">${esc(w.title)}</div></div>
+          <button class="btn small ghost" onclick="location.hash='#/lore/${w.id}'">📚 лор</button>
+          <button class="iconbtn" data-wedit="${w.id}">✏️</button>
         </div>`).join('')}
+      <button class="btn small" id="a-newworld">＋ Мир</button>
+    </div>
+
+    <div class="sect"><h3>Комнаты</h3>
+      ${S.worlds.map(w => `
+        <div class="hint" style="margin:6px 0 4px">${w.emoji} ${esc(w.title)}</div>
+        ${S.rooms.filter(r => r.world_id === w.id).map(r => `
+          <div class="list-item">
+            <div>${r.kind === 'chat' ? '💬' : '📜'}</div>
+            <div class="grow"><div class="t">${esc(r.title)}</div><div class="s">${esc(r.category)}${r.auto_ai_char_id ? ' · 🤖 авто' : ''}</div></div>
+            <button class="iconbtn" data-redit="${r.id}">✏️</button>
+          </div>`).join('')}
+      `).join('')}
       <button class="btn small" id="a-newroom">＋ Комната</button>
     </div>
 
     <div class="sect"><h3>ИИ-персонажи</h3>
       ${aiFull.map(c => `
         <div class="list-item">
-          <div class="ava" style="border-color:${c.color}">${c.emoji}</div>
-          <div class="grow"><div class="t">${esc(c.name)}</div><div class="s">${esc(c.model)}</div></div>
+          ${avaHtml(c)}
+          <div class="grow"><div class="t">${esc(c.name)}</div><div class="s">${esc(c.model)}${c.world_id ? ' · ' + esc(S.worlds.find(w => w.id === c.world_id)?.title || '') : ' · все миры'}</div></div>
           <button class="iconbtn" data-aiedit="${c.id}">✏️</button>
         </div>`).join('')}
       <button class="btn small" id="a-newai">＋ ИИ-персонаж</button>
+    </div>
+
+    <div class="sect"><h3>Расширения</h3>
+      ${extAll.extensions.map(x => `
+        <div class="list-item">
+          <div class="grow"><div class="t">${esc(x.name)}</div></div>
+          <button class="chip ${x.enabled ? 'on' : ''}" data-xtoggle="${x.id}" data-xval="${x.enabled}">${x.enabled ? 'вкл' : 'выкл'}</button>
+          <button class="iconbtn" data-xedit="${x.id}">✏️</button>
+          <button class="iconbtn" data-xdel="${x.id}">🗑</button>
+        </div>`).join('') || '<div class="hint">Нет расширений. Это свои CSS/JS-допилы интерфейса — ставь только то, чему доверяешь.</div>'}
+      <button class="btn small" id="a-newext">＋ Расширение</button>
     </div>
 
     <div class="sect"><h3>Инвайты</h3>
@@ -519,20 +825,34 @@ async function renderAdmin() {
 
     <div class="sect"><h3>Настройки</h3>
       <label>Название таверны</label><input id="s-title" value="${esc(settings.app_title)}">
-      <label>Промпт мира (видят все ИИ: сеттинг, правила, тон игры)</label>
-      <textarea id="s-world" rows="5">${esc(settings.world_prompt)}</textarea>
       <label>Дневной лимит по умолчанию, $ на игрока</label><input id="s-limit" value="${esc(settings.default_daily_limit_usd)}">
       <label>Модель летописца</label><input id="s-chmodel" value="${esc(settings.chronicle_model)}">
       <label>OpenRouter API-ключ ${settings.openrouter_key_set ? '(задан — впиши новый, чтобы сменить)' : '⚠️ не задан'}</label>
       <input id="s-key" type="password" placeholder="sk-or-...">
       <button class="btn" id="s-save" style="margin-top:8px">Сохранить настройки</button>
+      <div class="hint" style="margin-top:6px">Промпт мира теперь у каждого мира свой — в ✏️ мира.</div>
     </div>
   </div>`;
 
+  document.getElementById('a-newworld').onclick = () => worldForm();
+  document.querySelectorAll('[data-wedit]').forEach(b => b.onclick = async () => {
+    const { world } = await api(`/api/worlds/${b.dataset.wedit}`);
+    worldForm(world);
+  });
   document.getElementById('a-newroom').onclick = () => roomForm();
   document.querySelectorAll('[data-redit]').forEach(b => b.onclick = () => roomForm(S.rooms.find(r => r.id === +b.dataset.redit)));
   document.getElementById('a-newai').onclick = () => aiForm();
   document.querySelectorAll('[data-aiedit]').forEach(b => b.onclick = () => aiForm(aiFull.find(c => c.id === +b.dataset.aiedit)));
+  document.getElementById('a-newext').onclick = () => extForm();
+  document.querySelectorAll('[data-xedit]').forEach(b => b.onclick = () => extForm(extAll.extensions.find(x => x.id === +b.dataset.xedit)));
+  document.querySelectorAll('[data-xtoggle]').forEach(b => b.onclick = async () => {
+    await api(`/api/extensions/${b.dataset.xtoggle}`, { method: 'PATCH', body: { enabled: b.dataset.xval !== '1' } });
+    toast('Обновится после перезагрузки страницы'); renderAdmin();
+  });
+  document.querySelectorAll('[data-xdel]').forEach(b => b.onclick = async () => {
+    if (!confirm('Удалить расширение?')) return;
+    await api(`/api/extensions/${b.dataset.xdel}`, { method: 'DELETE' }); renderAdmin();
+  });
   document.getElementById('a-invite').onclick = async () => {
     const r = await api('/api/invites', { method: 'POST' });
     try { await navigator.clipboard.writeText(r.code); } catch {}
@@ -548,7 +868,6 @@ async function renderAdmin() {
   document.getElementById('s-save').onclick = async () => {
     const body = {
       app_title: document.getElementById('s-title').value,
-      world_prompt: document.getElementById('s-world').value,
       default_daily_limit_usd: document.getElementById('s-limit').value,
       chronicle_model: document.getElementById('s-chmodel').value,
     };
@@ -559,29 +878,82 @@ async function renderAdmin() {
   };
 }
 
+function worldForm(w) {
+  sheet(`
+    <h2>${w ? 'Мир' : 'Новый мир'}</h2>
+    <label>Название</label><input id="wf-title" value="${esc(w?.title || '')}">
+    <label>Эмодзи</label><input id="wf-emoji" value="${esc(w?.emoji || '🌍')}">
+    <label>Обложка</label>
+    ${coverField('wf-cover', w?.cover)}
+    <label>Промпт мира (сеттинг, правила, тон — видят все ИИ этого мира)</label>
+    <textarea id="wf-prompt" rows="6">${esc(w?.prompt || '')}</textarea>
+    <button class="btn" id="wf-save">Сохранить</button>
+    ${w ? `<button class="btn danger" id="wf-arch">📦 В архив</button>` : ''}
+  `, s => {
+    bindCoverField(s, 'wf-cover');
+    s.querySelector('#wf-save').onclick = async () => {
+      const body = {
+        title: s.querySelector('#wf-title').value,
+        emoji: s.querySelector('#wf-emoji').value || '🌍',
+        cover: s.querySelector('#wf-cover').value,
+        prompt: s.querySelector('#wf-prompt').value,
+      };
+      try {
+        if (w) await api(`/api/worlds/${w.id}`, { method: 'PATCH', body });
+        else await api('/api/worlds', { method: 'POST', body });
+        await refreshState(); closeSheet(); renderAdmin();
+      } catch (e) { toast(e.message, true); }
+    };
+    const a = s.querySelector('#wf-arch');
+    if (a) a.onclick = async () => {
+      if (!confirm('Убрать мир в архив? Комнаты и посты не удалятся.')) return;
+      await api(`/api/worlds/${w.id}`, { method: 'PATCH', body: { archived: true } });
+      await refreshState(); closeSheet(); renderAdmin();
+    };
+  });
+}
+
 function roomForm(r) {
+  const bots = S.ai_chars;
+  const attached = r?.ai_ids || [];
   sheet(`
     <h2>${r ? 'Комната' : 'Новая комната'}</h2>
     <label>Название</label><input id="rf-title" value="${esc(r?.title || '')}">
     <div class="row2">
+      <div><label>Мир</label>
+        <select id="rf-world">${S.worlds.map(w => `<option value="${w.id}" ${r?.world_id === w.id ? 'selected' : ''}>${w.emoji} ${esc(w.title)}</option>`).join('')}</select></div>
       <div><label>Тип</label>
         <select id="rf-kind">
           <option value="forum" ${r?.kind !== 'chat' ? 'selected' : ''}>📜 Форум (посты)</option>
           <option value="chat" ${r?.kind === 'chat' ? 'selected' : ''}>💬 Чат</option>
         </select></div>
-      <div><label>Раздел</label><input id="rf-cat" value="${esc(r?.category || 'Локации')}" placeholder="Локации / Флуд / Служебное"></div>
     </div>
+    <label>Раздел</label><input id="rf-cat" value="${esc(r?.category || 'Локации')}" placeholder="Локации / Флуд / Служебное">
+    <label>Обложка локации</label>
+    ${coverField('rf-cover', r?.cover)}
     <label>Описание локации (видят игроки и ИИ)</label>
     <textarea id="rf-desc" rows="4">${esc(r?.description || '')}</textarea>
+    <label>Боты этой комнаты</label>
+    ${bots.map(c => `<div class="checkline"><input type="checkbox" data-bot="${c.id}" ${attached.includes(c.id) ? 'checked' : ''}> <span>${c.emoji} ${esc(c.name)}</span></div>`).join('') || '<div class="hint">ИИ-персонажей пока нет</div>'}
+    <label>Авто-ответ (бот сам отвечает на каждый пост в роли — для сцен 1-на-1)</label>
+    <select id="rf-auto">
+      <option value="">— выключен —</option>
+      ${bots.map(c => `<option value="${c.id}" ${r?.auto_ai_char_id === c.id ? 'selected' : ''}>${c.emoji} ${esc(c.name)}</option>`).join('')}
+    </select>
     <button class="btn" id="rf-save">Сохранить</button>
     ${r ? `<button class="btn danger" id="rf-arch">📦 В архив</button>` : ''}
   `, s => {
+    bindCoverField(s, 'rf-cover');
     s.querySelector('#rf-save').onclick = async () => {
       const body = {
         title: s.querySelector('#rf-title').value,
+        world_id: +s.querySelector('#rf-world').value,
         kind: s.querySelector('#rf-kind').value,
         category: s.querySelector('#rf-cat').value,
+        cover: s.querySelector('#rf-cover').value,
         description: s.querySelector('#rf-desc').value,
+        ai_ids: [...s.querySelectorAll('[data-bot]:checked')].map(x => +x.dataset.bot),
+        auto_ai_char_id: +s.querySelector('#rf-auto').value || null,
       };
       try {
         if (r) await api(`/api/rooms/${r.id}`, { method: 'PATCH', body });
@@ -589,7 +961,8 @@ function roomForm(r) {
         await refreshState(); closeSheet(); renderAdmin();
       } catch (e) { toast(e.message, true); }
     };
-    if (r) s.querySelector('#rf-arch').onclick = async () => {
+    const a = s.querySelector('#rf-arch');
+    if (a) a.onclick = async () => {
       if (!confirm('Убрать комнату в архив? Посты не удалятся.')) return;
       await api(`/api/rooms/${r.id}`, { method: 'PATCH', body: { archived: true } });
       await refreshState(); closeSheet(); renderAdmin();
@@ -605,6 +978,13 @@ function aiForm(c) {
       <div><label>Эмодзи</label><input id="af-emoji" value="${esc(c?.emoji || '🤖')}"></div>
       <div><label>Цвет</label><input id="af-color" type="color" value="${c?.color || '#7c5cff'}" style="height:44px;padding:4px"></div>
     </div>
+    <label>Аватарка</label>
+    ${coverField('af-avatar', c?.avatar)}
+    <label>Мир</label>
+    <select id="af-world">
+      <option value="">🌐 Все миры</option>
+      ${S.worlds.map(w => `<option value="${w.id}" ${c?.world_id === w.id ? 'selected' : ''}>${w.emoji} ${esc(w.title)}</option>`).join('')}
+    </select>
     <label>Модель (слаг OpenRouter)</label>
     <input id="af-model" value="${esc(c?.model || 'anthropic/claude-sonnet-5.5')}" placeholder="anthropic/claude-opus-5.5">
     <label>Системный промпт (кто он, как пишет, чего не делает)</label>
@@ -617,11 +997,14 @@ function aiForm(c) {
     <button class="btn" id="af-save">Сохранить</button>
     ${c ? `<button class="btn danger" id="af-del">🗑 Удалить</button>` : ''}
   `, s => {
+    bindCoverField(s, 'af-avatar');
     s.querySelector('#af-save').onclick = async () => {
       const body = {
         name: s.querySelector('#af-name').value,
         emoji: s.querySelector('#af-emoji').value,
         color: s.querySelector('#af-color').value,
+        avatar: s.querySelector('#af-avatar').value,
+        world_id: +s.querySelector('#af-world').value || null,
         model: s.querySelector('#af-model').value,
         system_prompt: s.querySelector('#af-prompt').value,
         temperature: parseFloat(s.querySelector('#af-temp').value),
@@ -634,10 +1017,37 @@ function aiForm(c) {
         await refreshState(); closeSheet(); renderAdmin();
       } catch (e) { toast(e.message, true); }
     };
-    if (c) s.querySelector('#af-del').onclick = async () => {
+    const d = s.querySelector('#af-del');
+    if (d) d.onclick = async () => {
       if (!confirm('Удалить ИИ-персонажа?')) return;
       await api(`/api/ai-chars/${c.id}`, { method: 'PATCH', body: { deleted: true } });
       await refreshState(); closeSheet(); renderAdmin();
+    };
+  });
+}
+
+function extForm(x) {
+  sheet(`
+    <h2>${x ? 'Расширение' : 'Новое расширение'}</h2>
+    <label>Название</label><input id="xf-name" value="${esc(x?.name || '')}">
+    <label>CSS (вставляется на страницу)</label>
+    <textarea id="xf-css" rows="5" style="font-family:monospace;font-size:13px">${esc(x?.css || '')}</textarea>
+    <label>JS (выполняется при загрузке; доступен объект Tavern: api, toast, sheet, state)</label>
+    <textarea id="xf-js" rows="7" style="font-family:monospace;font-size:13px">${esc(x?.js || '')}</textarea>
+    <div class="hint">⚠️ Код выполняется у всех в браузере. Ставь только свой или проверенный.</div>
+    <button class="btn" id="xf-save">Сохранить</button>
+  `, s => {
+    s.querySelector('#xf-save').onclick = async () => {
+      const body = {
+        name: s.querySelector('#xf-name').value,
+        css: s.querySelector('#xf-css').value,
+        js: s.querySelector('#xf-js').value,
+      };
+      try {
+        if (x) await api(`/api/extensions/${x.id}`, { method: 'PATCH', body });
+        else await api('/api/extensions', { method: 'POST', body });
+        closeSheet(); toast('Сохранено — обновится после перезагрузки страницы'); renderAdmin();
+      } catch (e) { toast(e.message, true); }
     };
   });
 }

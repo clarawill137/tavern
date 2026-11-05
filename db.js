@@ -6,6 +6,7 @@ const fs = require('node:fs');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(path.join(DATA_DIR, 'uploads'), { recursive: true });
 
 const db = new DatabaseSync(path.join(DATA_DIR, 'tavern.db'));
 db.exec(`PRAGMA journal_mode = WAL;`);
@@ -17,7 +18,7 @@ CREATE TABLE IF NOT EXISTS users (
   pass_hash TEXT NOT NULL,
   salt TEXT NOT NULL,
   is_admin INTEGER NOT NULL DEFAULT 0,
-  daily_limit_usd REAL,              -- NULL = брать дефолт из settings
+  daily_limit_usd REAL,
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS invites (
@@ -38,26 +39,46 @@ CREATE TABLE IF NOT EXISTS personas (
   emoji TEXT NOT NULL DEFAULT '🎭',
   color TEXT NOT NULL DEFAULT '#c9a227',
   bio TEXT NOT NULL DEFAULT '',
+  avatar TEXT NOT NULL DEFAULT '',
   deleted INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS worlds (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  emoji TEXT NOT NULL DEFAULT '🌍',
+  cover TEXT NOT NULL DEFAULT '',
+  prompt TEXT NOT NULL DEFAULT '',
+  accent TEXT NOT NULL DEFAULT '',
+  position INTEGER NOT NULL DEFAULT 0,
+  archived INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS rooms (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  world_id INTEGER NOT NULL DEFAULT 1,
   title TEXT NOT NULL,
-  kind TEXT NOT NULL DEFAULT 'forum',           -- 'forum' | 'chat'
+  kind TEXT NOT NULL DEFAULT 'forum',
   category TEXT NOT NULL DEFAULT 'Локации',
   description TEXT NOT NULL DEFAULT '',
+  cover TEXT NOT NULL DEFAULT '',
+  auto_ai_char_id INTEGER,
   position INTEGER NOT NULL DEFAULT 0,
   chronicle TEXT NOT NULL DEFAULT '',
   chronicle_at INTEGER,
   archived INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS room_ai (
+  room_id INTEGER NOT NULL,
+  ai_char_id INTEGER NOT NULL,
+  PRIMARY KEY (room_id, ai_char_id)
+);
 CREATE TABLE IF NOT EXISTS posts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   room_id INTEGER NOT NULL,
-  user_id INTEGER,                 -- NULL если пост от ИИ
-  persona_id INTEGER,              -- маска игрока
-  ai_char_id INTEGER,              -- ИИ-персонаж
+  user_id INTEGER,
+  persona_id INTEGER,
+  ai_char_id INTEGER,
   body TEXT NOT NULL,
+  image TEXT NOT NULL DEFAULT '',
   is_ooc INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   edited_at INTEGER,
@@ -66,15 +87,41 @@ CREATE TABLE IF NOT EXISTS posts (
 CREATE INDEX IF NOT EXISTS idx_posts_room ON posts(room_id, id);
 CREATE TABLE IF NOT EXISTS ai_chars (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  world_id INTEGER,                    -- NULL = доступен во всех мирах
   name TEXT NOT NULL,
   emoji TEXT NOT NULL DEFAULT '🤖',
   color TEXT NOT NULL DEFAULT '#7c5cff',
+  avatar TEXT NOT NULL DEFAULT '',
   model TEXT NOT NULL,
   system_prompt TEXT NOT NULL DEFAULT '',
   temperature REAL NOT NULL DEFAULT 0.9,
   max_tokens INTEGER NOT NULL DEFAULT 1200,
   context_posts INTEGER NOT NULL DEFAULT 40,
   deleted INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS lorebooks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  world_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS lore_entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  book_id INTEGER NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  keys TEXT NOT NULL DEFAULT '',       -- ключи через запятую
+  content TEXT NOT NULL DEFAULT '',
+  always_on INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  position INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_lore_book ON lore_entries(book_id);
+CREATE TABLE IF NOT EXISTS extensions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  css TEXT NOT NULL DEFAULT '',
+  js TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS usage_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,7 +132,7 @@ CREATE TABLE IF NOT EXISTS usage_log (
   prompt_tokens INTEGER NOT NULL DEFAULT 0,
   completion_tokens INTEGER NOT NULL DEFAULT 0,
   cost_usd REAL NOT NULL DEFAULT 0,
-  kind TEXT NOT NULL DEFAULT 'post',   -- 'post' | 'chronicle'
+  kind TEXT NOT NULL DEFAULT 'post',
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS settings (
@@ -94,9 +141,27 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 `);
 
+// ---------- миграции со старой схемы (v1) ----------
+function addCol(table, colDef) {
+  try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${colDef}`); } catch { /* уже есть */ }
+}
+addCol('rooms', `world_id INTEGER NOT NULL DEFAULT 1`);
+addCol('rooms', `cover TEXT NOT NULL DEFAULT ''`);
+addCol('rooms', `auto_ai_char_id INTEGER`);
+addCol('posts', `image TEXT NOT NULL DEFAULT ''`);
+addCol('ai_chars', `world_id INTEGER`);
+addCol('ai_chars', `avatar TEXT NOT NULL DEFAULT ''`);
+addCol('personas', `avatar TEXT NOT NULL DEFAULT ''`);
+
+// дефолтный мир + перенос старого общего промпта мира
+if (db.prepare('SELECT COUNT(*) AS n FROM worlds').get().n === 0) {
+  const old = db.prepare(`SELECT value FROM settings WHERE key = 'world_prompt'`).get();
+  db.prepare(`INSERT INTO worlds(id, title, emoji, prompt, position) VALUES (1, 'Основной мир', '🕯️', ?, 0)`)
+    .run(old ? old.value : '');
+}
+
 const now = () => Date.now();
 
-// ---------- settings ----------
 function getSetting(key, fallback = null) {
   const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
   return row ? row.value : fallback;
@@ -106,7 +171,6 @@ function setSetting(key, value) {
               ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, String(value));
 }
 
-// ---------- users / auth ----------
 const q = {
   userByName: db.prepare('SELECT * FROM users WHERE username = ?'),
   userById: db.prepare('SELECT * FROM users WHERE id = ?'),
@@ -127,19 +191,29 @@ const q = {
 
   personasByUser: db.prepare('SELECT * FROM personas WHERE user_id = ? AND deleted = 0 ORDER BY id'),
   personaById: db.prepare('SELECT * FROM personas WHERE id = ?'),
-  insertPersona: db.prepare('INSERT INTO personas(user_id, name, emoji, color, bio) VALUES (?,?,?,?,?)'),
-  updatePersona: db.prepare('UPDATE personas SET name=?, emoji=?, color=?, bio=? WHERE id=? AND user_id=?'),
+  insertPersona: db.prepare('INSERT INTO personas(user_id, name, emoji, color, bio, avatar) VALUES (?,?,?,?,?,?)'),
+  updatePersona: db.prepare('UPDATE personas SET name=?, emoji=?, color=?, bio=?, avatar=? WHERE id=? AND user_id=?'),
   deletePersona: db.prepare('UPDATE personas SET deleted = 1 WHERE id=? AND user_id=?'),
   allPersonas: db.prepare(`SELECT p.*, u.username FROM personas p JOIN users u ON u.id = p.user_id WHERE p.deleted = 0`),
 
+  allWorlds: db.prepare('SELECT * FROM worlds WHERE archived = 0 ORDER BY position, id'),
+  worldById: db.prepare('SELECT * FROM worlds WHERE id = ?'),
+  insertWorld: db.prepare('INSERT INTO worlds(title, emoji, cover, prompt, accent, position) VALUES (?,?,?,?,?,?)'),
+  updateWorld: db.prepare('UPDATE worlds SET title=?, emoji=?, cover=?, prompt=?, accent=?, position=?, archived=? WHERE id=?'),
+
   allRooms: db.prepare('SELECT * FROM rooms WHERE archived = 0 ORDER BY category, position, id'),
+  roomsByWorld: db.prepare('SELECT * FROM rooms WHERE world_id = ? AND archived = 0 ORDER BY category, position, id'),
   roomById: db.prepare('SELECT * FROM rooms WHERE id = ?'),
-  insertRoom: db.prepare('INSERT INTO rooms(title, kind, category, description, position) VALUES (?,?,?,?,?)'),
-  updateRoom: db.prepare('UPDATE rooms SET title=?, kind=?, category=?, description=?, position=?, archived=? WHERE id=?'),
+  insertRoom: db.prepare('INSERT INTO rooms(world_id, title, kind, category, description, cover, position) VALUES (?,?,?,?,?,?,?)'),
+  updateRoom: db.prepare(`UPDATE rooms SET title=?, kind=?, category=?, description=?, cover=?, auto_ai_char_id=?, position=?, archived=? WHERE id=?`),
   setChronicle: db.prepare('UPDATE rooms SET chronicle=?, chronicle_at=? WHERE id=?'),
 
-  insertPost: db.prepare(`INSERT INTO posts(room_id, user_id, persona_id, ai_char_id, body, is_ooc, created_at)
-                          VALUES (?,?,?,?,?,?,?)`),
+  roomAi: db.prepare('SELECT ai_char_id FROM room_ai WHERE room_id = ?'),
+  clearRoomAi: db.prepare('DELETE FROM room_ai WHERE room_id = ?'),
+  addRoomAi: db.prepare('INSERT OR IGNORE INTO room_ai(room_id, ai_char_id) VALUES (?,?)'),
+
+  insertPost: db.prepare(`INSERT INTO posts(room_id, user_id, persona_id, ai_char_id, body, image, is_ooc, created_at)
+                          VALUES (?,?,?,?,?,?,?,?)`),
   postById: db.prepare('SELECT * FROM posts WHERE id = ?'),
   editPost: db.prepare('UPDATE posts SET body = ?, edited_at = ? WHERE id = ?'),
   deletePost: db.prepare('UPDATE posts SET deleted = 1 WHERE id = ?'),
@@ -150,9 +224,30 @@ const q = {
 
   aiChars: db.prepare('SELECT * FROM ai_chars WHERE deleted = 0 ORDER BY id'),
   aiCharById: db.prepare('SELECT * FROM ai_chars WHERE id = ?'),
-  insertAiChar: db.prepare(`INSERT INTO ai_chars(name, emoji, color, model, system_prompt, temperature, max_tokens, context_posts)
-                            VALUES (?,?,?,?,?,?,?,?)`),
-  updateAiChar: db.prepare(`UPDATE ai_chars SET name=?, emoji=?, color=?, model=?, system_prompt=?, temperature=?, max_tokens=?, context_posts=?, deleted=? WHERE id=?`),
+  insertAiChar: db.prepare(`INSERT INTO ai_chars(world_id, name, emoji, color, avatar, model, system_prompt, temperature, max_tokens, context_posts)
+                            VALUES (?,?,?,?,?,?,?,?,?,?)`),
+  updateAiChar: db.prepare(`UPDATE ai_chars SET world_id=?, name=?, emoji=?, color=?, avatar=?, model=?, system_prompt=?, temperature=?, max_tokens=?, context_posts=?, deleted=? WHERE id=?`),
+
+  booksByWorld: db.prepare('SELECT * FROM lorebooks WHERE world_id = ? ORDER BY id'),
+  bookById: db.prepare('SELECT * FROM lorebooks WHERE id = ?'),
+  insertBook: db.prepare('INSERT INTO lorebooks(world_id, name, enabled) VALUES (?,?,1)'),
+  updateBook: db.prepare('UPDATE lorebooks SET name=?, enabled=? WHERE id=?'),
+  deleteBook: db.prepare('DELETE FROM lorebooks WHERE id=?'),
+  entriesByBook: db.prepare('SELECT * FROM lore_entries WHERE book_id = ? ORDER BY position, id'),
+  activeEntriesByWorld: db.prepare(`SELECT e.* FROM lore_entries e JOIN lorebooks b ON b.id = e.book_id
+                                    WHERE b.world_id = ? AND b.enabled = 1 AND e.enabled = 1 ORDER BY e.position, e.id`),
+  entryById: db.prepare('SELECT * FROM lore_entries WHERE id = ?'),
+  insertEntry: db.prepare('INSERT INTO lore_entries(book_id, title, keys, content, always_on, enabled, position) VALUES (?,?,?,?,?,?,?)'),
+  updateEntry: db.prepare('UPDATE lore_entries SET title=?, keys=?, content=?, always_on=?, enabled=?, position=? WHERE id=?'),
+  deleteEntry: db.prepare('DELETE FROM lore_entries WHERE id=?'),
+  deleteBookEntries: db.prepare('DELETE FROM lore_entries WHERE book_id=?'),
+
+  allExtensions: db.prepare('SELECT * FROM extensions ORDER BY id'),
+  enabledExtensions: db.prepare('SELECT * FROM extensions WHERE enabled = 1 ORDER BY id'),
+  extensionById: db.prepare('SELECT * FROM extensions WHERE id = ?'),
+  insertExtension: db.prepare('INSERT INTO extensions(name, css, js, enabled) VALUES (?,?,?,1)'),
+  updateExtension: db.prepare('UPDATE extensions SET name=?, css=?, js=?, enabled=? WHERE id=?'),
+  deleteExtension: db.prepare('DELETE FROM extensions WHERE id=?'),
 
   insertUsage: db.prepare(`INSERT INTO usage_log(user_id, ai_char_id, room_id, model, prompt_tokens, completion_tokens, cost_usd, kind, created_at)
                            VALUES (?,?,?,?,?,?,?,?,?)`),
