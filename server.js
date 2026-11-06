@@ -5,8 +5,8 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { q, now, getSetting, setSetting, DATA_DIR } = require('./db');
-const { aiPost, chronicle, spentToday, dailyLimitFor } = require('./ai');
-const { NEEDS, computeNeeds, parseMemory } = require('./game');
+const { aiPost, chronicle, spentToday, dailyLimitFor, queueLifeChron, undoLifeChron, fillFromCard, draw, DEFAULT_ART } = require('./ai');
+const life = require('./life');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -50,15 +50,19 @@ function auth(req) {
 }
 
 const publicUser = u => ({ id: u.id, username: u.username, is_admin: !!u.is_admin });
-const publicPost = p => ({
-  id: p.id, room_id: p.room_id, user_id: p.user_id, persona_id: p.persona_id,
-  ai_char_id: p.ai_char_id, body: p.body, image: p.image || '', is_ooc: !!p.is_ooc,
-  created_at: p.created_at, edited_at: p.edited_at,
-});
+const publicPost = p => {
+  const ch = life.json(p.chron, null);
+  return {
+    id: p.id, room_id: p.room_id, user_id: p.user_id, persona_id: p.persona_id,
+    ai_char_id: p.ai_char_id, body: p.body, image: p.image || '', is_ooc: !!p.is_ooc,
+    created_at: p.created_at, edited_at: p.edited_at,
+    chron: ch ? { chips: ch.chips || [], at: ch.at } : null,
+  };
+};
 const publicRoom = (r, lastTimes, previews) => ({
   id: r.id, world_id: r.world_id, title: r.title, kind: r.kind, category: r.category,
   description: r.description, cover: r.cover || '', auto_ai_char_id: r.auto_ai_char_id,
-  map_x: r.map_x, map_y: r.map_y,
+  map_x: r.map_x, map_y: r.map_y, chron_on: r.chron_on, scene: life.sceneOf(r),
   chronicle: r.chronicle, chronicle_at: r.chronicle_at,
   ai_ids: q.roomAi.all(r.id).map(x => x.ai_char_id),
   last_at: lastTimes?.[r.id]?.last_at || null, post_count: lastTimes?.[r.id]?.n || 0,
@@ -74,16 +78,34 @@ function broadcast(event) {
 
 const genLocks = new Set();
 
+// Летописец после поста: по очереди в мире, траты — на того, кто запостил/позвал
+function lifeAfter(post, user) {
+  return queueLifeChron({ user, post })
+    .then(r => { if (r) broadcast({ type: 'chron', room_id: r.room_id, world_id: r.world_id, post_id: r.post_id, chips: r.chips }); return r; })
+    .catch(e => { broadcast({ type: 'chron_error', room_id: post.room_id, message: e.message }); return null; });
+}
+
+// ИИ пишет пост: взвод инициативы → генерация → отметка сыгранного → Летописец
+async function makeAiPost({ user, room, aiChar, instruction }) {
+  const seq = (q.lastPosts.get?.(room.id, 1)?.id) || Date.now();
+  const text = await aiPost({ user, room, aiChar, instruction: instruction || '', postSeq: seq });
+  const r = q.insertPost.run(room.id, null, null, aiChar.id, text, '', 0, now());
+  const post = q.postById.get(Number(r.lastInsertRowid));
+  life.afterAiPost(room, life.charInfo(life.keyOf('a', aiChar.id)), post.id);
+  broadcast({ type: 'post', post: publicPost(post) });
+  lifeAfter(post, user);
+  return post;
+}
+
 // авто-ответ бота после поста игрока (сцены 1-на-1)
-async function autoAiReply(room, user) {
+async function autoAiReply(room, user, chronDone) {
   const aiChar = q.aiCharById.get(room.auto_ai_char_id || 0);
   if (!aiChar || aiChar.deleted || genLocks.has(room.id)) return;
   genLocks.add(room.id);
   broadcast({ type: 'ai_typing', room_id: room.id, ai_char_id: aiChar.id, on: true });
   try {
-    const text = await aiPost({ user, room, aiChar, instruction: '' });
-    const r = q.insertPost.run(room.id, null, null, aiChar.id, text, '', 0, now());
-    broadcast({ type: 'post', post: publicPost(q.postById.get(Number(r.lastInsertRowid))) });
+    await chronDone; // сначала Летописец — бот видит свежее состояние
+    await makeAiPost({ user, room: q.roomById.get(room.id), aiChar, instruction: '' });
   } catch (e) {
     broadcast({ type: 'ai_error', room_id: room.id, message: e.message });
   } finally {
@@ -96,7 +118,7 @@ async function autoAiReply(room, user) {
 const routes = [];
 function route(method, pattern, handler, { admin = false, open = false } = {}) {
   const keys = [];
-  const rx = new RegExp('^' + pattern.replace(/:(\w+)/g, (_, k) => { keys.push(k); return '(\\d+)'; }) + '$');
+  const rx = new RegExp('^' + pattern.replace(/([:@])(\w+)/g, (_, s, k) => { keys.push((s === '@' ? '@' : '') + k); return s === '@' ? '([pa])' : '(\\d+)'; }) + '$');
   routes.push({ method, rx, keys, handler, admin, open });
 }
 
@@ -106,7 +128,7 @@ async function handleApi(req, res, pathname) {
     const m = pathname.match(r.rx);
     if (!m) continue;
     const params = {};
-    r.keys.forEach((k, i) => params[k] = parseInt(m[i + 1], 10));
+    r.keys.forEach((k, i) => { if (k[0] === '@') params[k.slice(1)] = m[i + 1]; else params[k] = parseInt(m[i + 1], 10); });
     let user = null;
     if (!r.open) {
       user = auth(req);
@@ -176,7 +198,7 @@ route('GET', '/api/state', async (req, res, { user }) => {
   json(res, 200, {
     me: publicUser(user),
     app_title: getSetting('app_title', 'Таверна'),
-    worlds: q.allWorlds.all().map(w => ({ id: w.id, title: w.title, emoji: w.emoji, cover: w.cover, accent: w.accent, map: w.map || '' })),
+    worlds: q.allWorlds.all().map(w => ({ id: w.id, title: w.title, emoji: w.emoji, cover: w.cover, accent: w.accent, map: w.map || '', clock: w.clock || '' })),
     rooms: q.allRooms.all().map(r => publicRoom(r, lastTimes, previews)),
     my_personas: q.personasByUser.all(user.id),
     all_personas: q.allPersonas.all().map(p => ({ id: p.id, name: p.name, emoji: p.emoji, color: p.color, avatar: p.avatar || '', username: p.username, user_id: p.user_id })),
@@ -237,74 +259,233 @@ route('DELETE', '/api/personas/:id', async (req, res, { params, user }) => {
   json(res, 200, { ok: true });
 });
 
-// ----- игровой движок: профиль персонажа, инвентарь, память, потребности -----
-route('GET', '/api/personas/:id/state', async (req, res, { params, user }) => {
-  const p = q.personaById.get(params.id);
-  if (!p || p.deleted) return err(res, 404, 'Нет персонажа');
-  const mine = p.user_id === user.id;
+// ----- Life: карточки персонажей, жизнь, гардероб, вещи, связи -----
+// Ключ персонажа: /api/life/p/12 — маска игрока, /api/life/a/3 — ИИ-персонаж
+function lifeKey(t, id) { return life.keyOf(t, id); }
+function canEdit(user, c) { return !!c && (user.is_admin || (!c.ai && c.user_id === user.id)); }
+function canSeeInner(user, c) { return !!c && (c.ai || user.is_admin || c.user_id === user.id || life.prof(c.key).share); }
+function worldFrom(req) {
+  const w = parseInt(new URL(req.url, 'http://x').searchParams.get('world') || '0', 10);
+  return q.worldById.get(w) ? w : (q.allWorlds.all()[0]?.id || 1);
+}
+function lifeView(user, c, W) {
+  const p = life.prof(c.key), x = life.state(W, c.key);
+  const seeInner = canSeeInner(user, c);
+  const k = life.parseKey(c.key);
+  const loc = q.lastPostOfAuthorInWorld.get(W, k.t, k.id, k.t, k.id);
+  const items = q.itemsByOwner.all(c.key).map(i => ({ ...i, story: life.json(i.story, []), from_name: i.from_key ? life.charInfo(i.from_key)?.name || '' : '' }));
+  const out = {
+    char: { key: c.key, t: c.t, id: c.id, name: c.name, ai: c.ai, user_id: c.user_id, avatar: c.avatar, emoji: c.emoji, color: c.color, bio: c.ai ? '' : c.bio },
+    can_edit: canEdit(user, c), can_see: seeInner, world_id: W,
+    prof: { card: p.card, likes: p.likes, dislikes: p.dislikes, hobbies: p.hobbies, facts: p.facts, fem: p.fem, share: p.share },
+    outfit: x.outfit, state_label: life.stateLabel(x, p),
+    location: loc ? { room_id: loc.room_id, at: loc.created_at } : null,
+    items: seeInner || canEdit(user, c) ? items : items.filter(i => i.kind === 'образ' || i.equipped),
+  };
+  if (seeInner) {
+    const b = life.bodyView(W, c.key, x, p);
+    out.prof = { ...out.prof, turnons: p.turnons, romance: p.romance, init: p.init, talk: p.talk, metab: p.metab, inner: p.inner };
+    out.body = b.needs; out.urgent = b.urgent; out.wounds = b.wounds;
+    out.state = x.state; out.thoughts = x.thoughts; out.wants = x.wants; out.ideas = x.ideas; out.armed = x.armed;
+    const rels = q.relsOf.all(W, c.key, c.key);
+    const others = new Set(rels.map(r => r.from_key === c.key ? r.to_key : r.from_key));
+    out.relations = [...others].map(o => {
+      const oc = life.charInfo(o); if (!oc) return null;
+      const ab = life.rel(W, c.key, o), ba = life.rel(W, o, c.key);
+      const backHidden = !oc.ai && !canSeeInner(user, oc);
+      return { key: o, name: oc.name, avatar: oc.avatar, emoji: oc.emoji, ai: oc.ai, out: ab, back: backHidden ? null : ba, moments: [...ab.moments, ...ba.moments].slice(-6) };
+    }).filter(Boolean);
+  }
+  return out;
+}
+
+route('GET', '/api/life/meta', async (req, res) => {
   json(res, 200, {
-    persona: { id: p.id, name: p.name, emoji: p.emoji, color: p.color, avatar: p.avatar || '', bio: p.bio, user_id: p.user_id, realism: !!p.realism },
-    mine,
-    needs: computeNeeds(p),
-    need_labels: NEEDS.map(([k, label]) => [k, label]),
-    memory: parseMemory(p),
-    items: (mine ? q.itemsByPersona.all(p.id) : q.equippedByPersona.all(p.id)),
+    needs: life.NEEDS, states: life.STATES.map(s => [s[0], s[1], s[2], s[3]]), moods: life.MOODS.map(m => [m[0], m[1], m[2]]),
+    tones: life.TONES.map(t => [t[0], t[1], t[2], t[3]]), scales: life.SCALES, idea_kinds: life.IDEA_KINDS,
+    freq: Object.fromEntries(Object.entries(life.FREQ).map(([k, v]) => [k, v[2]])),
   });
 });
 
-route('PATCH', '/api/personas/:id/memory', async (req, res, { params, user }) => {
-  const p = q.personaById.get(params.id);
-  if (!p || p.user_id !== user.id) return err(res, 404, 'Не твой персонаж');
-  const { memory } = await readBody(req);
-  if (!Array.isArray(memory)) return err(res, 400, 'memory должен быть списком строк');
-  q.setPersonaMemory.run(JSON.stringify(memory.map(String).slice(0, 100)), p.id);
+route('GET', '/api/life/@t/:id', async (req, res, { params, user }) => {
+  const c = life.charInfo(lifeKey(params.t, params.id));
+  if (!c) return err(res, 404, 'Нет персонажа');
+  json(res, 200, lifeView(user, c, worldFrom(req)));
+});
+
+// профиль: карточка личности, вкусы, характер, ухаживания, инициатива, видимость
+route('PATCH', '/api/life/@t/:id/prof', async (req, res, { params, user }) => {
+  const c = life.charInfo(lifeKey(params.t, params.id));
+  if (!canEdit(user, c)) return err(res, 403, 'Нельзя');
+  const b = await readBody(req);
+  const p = life.prof(c.key);
+  if (b.card && typeof b.card === 'object') for (const f of ['age', 'look', 'traits', 'story']) if (b.card[f] != null) p.card[f] = life.cut(b.card[f], 2000);
+  for (const f of ['likes', 'dislikes', 'hobbies', 'turnons', 'facts']) if (Array.isArray(b[f])) p[f] = b[f].map(s => life.cut(s, 200)).filter(Boolean).slice(0, 60);
+  if (typeof b.fem === 'boolean') p.fem = b.fem;
+  if ([1, 1.5, 2].includes(b.metab)) p.metab = b.metab;
+  if (typeof b.share === 'boolean') p.share = b.share;
+  if (typeof b.inner === 'boolean') p.inner = b.inner;
+  if (b.talk && life.FREQ[b.talk]) p.talk = b.talk;
+  if (b.romance && typeof b.romance === 'object') p.romance = { ...p.romance, ...b.romance };
+  if (b.init && typeof b.init === 'object') {
+    if (life.FREQ[b.init.freq]) p.init.freq = b.init.freq;
+    if (Array.isArray(b.init.kinds)) p.init.kinds = b.init.kinds.filter(k => life.IDEA_KINDS[k]);
+  }
+  life.saveProf(c.key, p);
+  broadcast({ type: 'life', key: c.key });
   json(res, 200, { ok: true });
 });
 
-route('PATCH', '/api/personas/:id/needs', async (req, res, { params, user }) => {
-  const p = q.personaById.get(params.id);
-  if (!p || p.user_id !== user.id) return err(res, 404, 'Не твой персонаж');
+// состояние в мире: тело, состояние, мысли, желания, идеи, одежда, взвести
+route('PATCH', '/api/life/@t/:id/state', async (req, res, { params, user }) => {
+  const c = life.charInfo(lifeKey(params.t, params.id));
+  if (!canEdit(user, c)) return err(res, 403, 'Нельзя');
+  const W = worldFrom(req);
   const b = await readBody(req);
-  const cur = computeNeeds(p);
-  const nowT = now();
-  const raw = {};
-  for (const [k] of NEEDS) {
-    const v = b.needs && typeof b.needs[k] === 'number' ? b.needs[k] : cur[k];
-    raw[k] = { v: Math.max(5, Math.min(100, v)), at: nowT };
+  const x = life.state(W, c.key), h = life.worldHours(W);
+  if (b.body && typeof b.body === 'object') for (const [k] of life.NEEDS) if (typeof b.body[k] === 'number') life.setNeed(x, k, b.body[k], h);
+  if (b.state !== undefined) x.state = b.state && life.STATES.some(s => s[0] === b.state) ? { id: b.state, why: life.cut(b.why || '', 60), manual: true } : null;
+  if (typeof b.outfit === 'string') x.outfit = life.cut(b.outfit, 300);
+  if (b.wound_del != null) x.wounds = x.wounds.filter(w => w.id !== b.wound_del);
+  if (b.wound_add) x.wounds.push({ id: ++x.seq, t: life.cut(b.wound_add, 50), at: h });
+  for (const f of ['thoughts', 'wants']) {
+    if (b[`${f}_add`]) x[f].push({ id: life.uid(), t: life.cut(b[`${f}_add`], 120), w: 1, status: 'on', by: 'hand', with: life.cut(b.with || '', 40) });
+    if (b[`${f}_set`] && typeof b[`${f}_set`] === 'object') { const y = x[f].find(i => i.id === b[`${f}_set`].id); if (y) Object.assign(y, { status: b[`${f}_set`].status ?? y.status, w: b[`${f}_set`].w ?? y.w }); }
+    if (b[`${f}_del`]) x[f] = x[f].filter(i => i.id !== b[`${f}_del`]);
   }
-  const realism = b.realism != null ? (b.realism ? 1 : 0) : p.realism;
-  q.setPersonaNeeds.run(JSON.stringify(raw), realism, p.id);
-  json(res, 200, { ok: true, needs: computeNeeds({ ...p, needs: JSON.stringify(raw), realism }) });
+  if (b.idea_add && b.idea_add.text) x.ideas.push({ id: life.uid(), kind: life.IDEA_KINDS[b.idea_add.kind] ? b.idea_add.kind : 'care', text: life.cut(b.idea_add.text, 160), when: 'scene', status: 'new', by: 'hand' });
+  if (b.idea_set) { const y = x.ideas.find(i => i.id === b.idea_set.id); if (y && ['new', 'skip', 'done'].includes(b.idea_set.status)) y.status = b.idea_set.status; }
+  if (b.arm !== undefined) {
+    if (!b.arm) x.armed = null;
+    else if (['idea', 'thought', 'want'].includes(b.arm.kind)) { x.armed = { kind: b.arm.kind, id: b.arm.id, at: 0, manual: true }; if (b.arm.kind === 'idea') { const y = x.ideas.find(i => i.id === b.arm.id); if (y) y.status = 'armed'; } }
+  }
+  life.saveState(W, c.key, x);
+  broadcast({ type: 'life', key: c.key });
+  json(res, 200, { ok: true });
 });
 
-route('POST', '/api/personas/:id/items', async (req, res, { params, user }) => {
-  const p = q.personaById.get(params.id);
-  if (!p || p.user_id !== user.id) return err(res, 404, 'Не твой персонаж');
+// шкалы отношений руками: from → to
+route('PATCH', '/api/life/@t/:id/rel', async (req, res, { params, user }) => {
+  const c = life.charInfo(lifeKey(params.t, params.id));
+  if (!canEdit(user, c)) return err(res, 403, 'Нельзя');
+  const W = worldFrom(req);
+  const b = await readBody(req);
+  const o = life.charInfo(b.to); if (!o || o.key === c.key) return err(res, 400, 'К кому?');
+  const r = life.rel(W, c.key, o.key);
+  for (const [f] of life.SCALES) if (typeof b[f] === 'number') r[f] = Math.max(0, Math.min(100, Math.round(b[f])));
+  if (b.moment) r.moments.push({ text: life.cut(b.moment, 60), by: 'hand' });
+  life.saveRel(W, c.key, o.key, r);
+  broadcast({ type: 'life', key: c.key });
+  json(res, 200, { ok: true });
+});
+
+route('POST', '/api/life/@t/:id/fill', async (req, res, { params, user }) => {
+  const c = life.charInfo(lifeKey(params.t, params.id));
+  if (!canEdit(user, c)) return err(res, 403, 'Нельзя');
+  await fillFromCard({ user, key: c.key, worldId: worldFrom(req) });
+  broadcast({ type: 'life', key: c.key });
+  json(res, 200, { ok: true, spent_today: spentToday(user.id) });
+});
+
+// вещи, гардероб, гараж
+route('POST', '/api/life/@t/:id/items', async (req, res, { params, user }) => {
+  const c = life.charInfo(lifeKey(params.t, params.id));
+  if (!canEdit(user, c)) return err(res, 403, 'Нельзя');
   const b = await readBody(req);
   if (!b.name) return err(res, 400, 'Название обязательно');
-  const kind = ['одежда', 'транспорт', 'вещь'].includes(b.kind) ? b.kind : 'вещь';
-  const r = q.insertItem.run(p.id, kind, String(b.name), b.descr || '', b.image || '', b.equipped ? 1 : 0, now());
+  const kind = ['образ', 'одежда', 'транспорт', 'вещь'].includes(b.kind) ? b.kind : 'вещь';
+  if (kind === 'образ' && b.equipped) q.unequipLooks.run(c.key);
+  const r = q.insertItem.run(c.t === 'p' ? c.id : 0, c.key, kind, life.cut(b.name, 80), life.cut(b.descr || '', 600), b.image || '', b.equipped ? 1 : 0, '[]', '', now());
+  if (kind === 'образ' && b.equipped) { const W = worldFrom(req); const x = life.state(W, c.key); x.outfit = life.cut(b.descr || b.name, 300); life.saveState(W, c.key, x); }
+  broadcast({ type: 'life', key: c.key });
   json(res, 200, { ok: true, id: Number(r.lastInsertRowid) });
 });
 
 route('PATCH', '/api/items/:id', async (req, res, { params, user }) => {
   const it = q.itemById.get(params.id);
   if (!it) return err(res, 404, 'Нет предмета');
-  const p = q.personaById.get(it.persona_id);
-  if (!p || p.user_id !== user.id) return err(res, 403, 'Не твой предмет');
+  const c = life.charInfo(it.owner_key);
+  if (!canEdit(user, c)) return err(res, 403, 'Не твой предмет');
   const b = await readBody(req);
-  q.updateItem.run(b.kind ?? it.kind, b.name ?? it.name, b.descr ?? it.descr, b.image ?? it.image,
-    b.equipped != null ? (b.equipped ? 1 : 0) : it.equipped, it.id);
+  const equipped = b.equipped != null ? (b.equipped ? 1 : 0) : it.equipped;
+  if (it.kind === 'образ' && equipped && !it.equipped) {
+    q.unequipLooks.run(c.key);
+    const W = worldFrom(req); const x = life.state(W, c.key); x.outfit = life.cut(b.descr ?? it.descr ?? it.name, 300); life.saveState(W, c.key, x);
+  }
+  let owner = it.owner_key;
+  if (b.give_to) { const to = life.charInfo(b.give_to); if (to) owner = to.key; }
+  q.updateItem.run(b.kind ?? it.kind, b.name ?? it.name, b.descr ?? it.descr, b.image ?? it.image, equipped, it.story, owner !== it.owner_key ? it.owner_key : it.from_key, owner, it.id);
+  broadcast({ type: 'life', key: c.key });
   json(res, 200, { ok: true });
 });
 
 route('DELETE', '/api/items/:id', async (req, res, { params, user }) => {
   const it = q.itemById.get(params.id);
   if (!it) return err(res, 404, 'Нет предмета');
-  const p = q.personaById.get(it.persona_id);
-  if (!p || p.user_id !== user.id) return err(res, 403, 'Не твой предмет');
+  const c = life.charInfo(it.owner_key);
+  if (!canEdit(user, c)) return err(res, 403, 'Не твой предмет');
   q.deleteItem.run(it.id);
+  broadcast({ type: 'life', key: c.key });
   json(res, 200, { ok: true });
+});
+
+// кто где в мире + время истории (для карты и сетки персонажей)
+route('GET', '/api/worlds/:id/brief', async (req, res, { params, user }) => {
+  const w = q.worldById.get(params.id);
+  if (!w) return err(res, 404, 'Нет мира');
+  const keys = [...q.allPersonas.all().map(p => life.keyOf('p', p.id)), ...q.aiChars.all().filter(c => !c.world_id || c.world_id === w.id).map(c => life.keyOf('a', c.id))];
+  const chars = {};
+  for (const k of keys) {
+    const c = life.charInfo(k); if (!c) continue;
+    const pk = life.parseKey(k);
+    const loc = q.lastPostOfAuthorInWorld.get(w.id, pk.t, pk.id, pk.t, pk.id);
+    const x = life.state(w.id, k), p = life.prof(k);
+    chars[k] = { room_id: loc?.room_id || null, at: loc?.created_at || null, outfit: x.outfit, state: canSeeInner(user, c) ? life.stateLabel(x, p) : '' };
+  }
+  json(res, 200, { clock: w.clock, hours: w.hours, chars });
+});
+
+// сцена: тон, близость, беременность, «забота после»
+route('PATCH', '/api/rooms/:id/scene', async (req, res, { params }) => {
+  const room = q.roomById.get(params.id);
+  if (!room) return err(res, 404, 'Нет комнаты');
+  const b = await readBody(req);
+  const sc = life.sceneOf(room);
+  if (b.set !== undefined) sc.set = life.MOODS.some(m => m[0] === b.set) ? b.set : '';
+  if (b.intim !== undefined) sc.intim = ['auto', 'on', 'off'].includes(b.intim) ? b.intim : 'auto';
+  if (b.tone !== undefined) sc.tone = life.TONES.some(t => t[0] === b.tone) ? b.tone : '';
+  if (typeof b.preg === 'boolean') sc.preg = b.preg;
+  if (typeof b.care === 'boolean') sc.care = b.care;
+  q.setRoomScene.run(JSON.stringify(sc), room.id);
+  broadcast({ type: 'scene', room_id: room.id, scene: sc });
+  json(res, 200, { ok: true, scene: sc });
+});
+
+// Летописец: перепрогнать / откатить
+route('POST', '/api/posts/:id/chron', async (req, res, { params, user }) => {
+  const p = q.postById.get(params.id);
+  if (!p || p.deleted) return err(res, 404, 'Нет поста');
+  const r = await queueLifeChron({ user, post: p, force: true });
+  if (r) broadcast({ type: 'chron', room_id: r.room_id, world_id: r.world_id, post_id: r.post_id, chips: r.chips });
+  json(res, 200, { ok: true, chips: r?.chips || [] });
+});
+route('POST', '/api/posts/:id/chron/undo', async (req, res, { params, user }) => {
+  const p = q.postById.get(params.id);
+  if (!p) return err(res, 404, 'Нет поста');
+  if (p.user_id !== user.id && !user.is_admin) return err(res, 403, 'Откатить может автор поста или админ');
+  undoLifeChron(p);
+  broadcast({ type: 'chron', room_id: p.room_id, post_id: p.id, chips: null });
+  json(res, 200, { ok: true });
+});
+
+// картинки: портреты, образы, вещи, обложки мест, карты
+route('POST', '/api/draw', async (req, res, { user }) => {
+  const b = await readBody(req);
+  if (!b.prompt) return err(res, 400, 'Что рисуем?');
+  const aspect = ['1:1', '3:4', '4:3', '16:9', '9:16', '2:3', '3:2'].includes(b.aspect) ? b.aspect : '1:1';
+  const refs = Array.isArray(b.refs) ? b.refs.filter(u => typeof u === 'string' && u.startsWith('/uploads/')) : [];
+  const url = await draw({ user, prompt: life.cut(b.prompt, 3000), aspect, refs, worldId: b.world_id || null });
+  json(res, 200, { ok: true, url, spent_today: spentToday(user.id) });
 });
 
 // ----- миры -----
@@ -328,7 +509,7 @@ route('PATCH', '/api/worlds/:id', async (req, res, { params }) => {
   const b = await readBody(req);
   q.updateWorld.run(b.title ?? w.title, b.emoji ?? w.emoji, b.cover ?? w.cover, b.prompt ?? w.prompt,
     b.accent ?? w.accent, b.position ?? w.position, b.archived != null ? (b.archived ? 1 : 0) : w.archived,
-    b.map ?? w.map ?? '', w.id);
+    b.map ?? w.map ?? '', b.art_style ?? w.art_style ?? '', w.id);
   broadcast({ type: 'rooms' });
   json(res, 200, { ok: true });
 }, { admin: true });
@@ -357,7 +538,8 @@ route('PATCH', '/api/rooms/:id', async (req, res, { params }) => {
     b.position ?? room.position,
     b.archived != null ? (b.archived ? 1 : 0) : room.archived,
     b.map_x !== undefined ? b.map_x : room.map_x,
-    b.map_y !== undefined ? b.map_y : room.map_y, room.id);
+    b.map_y !== undefined ? b.map_y : room.map_y,
+    b.chron_on !== undefined ? (b.chron_on === null ? -1 : b.chron_on ? 1 : 0) : room.chron_on, room.id);
   if (Array.isArray(b.ai_ids)) {
     q.clearRoomAi.run(room.id);
     for (const id of b.ai_ids) q.addRoomAi.run(room.id, id);
@@ -388,11 +570,13 @@ route('POST', '/api/rooms/:id/posts', async (req, res, { params, user }) => {
   }
   const img = image && String(image).startsWith('/uploads/') ? String(image) : '';
   const r = q.insertPost.run(room.id, user.id, pid, null, String(body || ''), img, is_ooc ? 1 : 0, now());
-  const post = publicPost(q.postById.get(Number(r.lastInsertRowid)));
+  const raw = q.postById.get(Number(r.lastInsertRowid));
+  const post = publicPost(raw);
   broadcast({ type: 'post', post });
   json(res, 200, { ok: true, post });
-  // авто-ответ бота: только на пост «в роли»
-  if (pid && !is_ooc && room.auto_ai_char_id) autoAiReply(room, user);
+  // Летописец, потом авто-ответ бота (только на пост «в роли»)
+  const chronDone = pid && !is_ooc ? lifeAfter(raw, user) : Promise.resolve(null);
+  if (pid && !is_ooc && room.auto_ai_char_id) autoAiReply(room, user, chronDone);
 });
 
 route('PATCH', '/api/posts/:id', async (req, res, { params, user }) => {
@@ -427,11 +611,8 @@ route('POST', '/api/rooms/:id/ai', async (req, res, { params, user }) => {
   genLocks.add(room.id);
   broadcast({ type: 'ai_typing', room_id: room.id, ai_char_id: aiChar.id, on: true });
   try {
-    const text = await aiPost({ user, room, aiChar, instruction: instruction || '' });
-    const r = q.insertPost.run(room.id, null, null, aiChar.id, text, '', 0, now());
-    const post = publicPost(q.postById.get(Number(r.lastInsertRowid)));
-    broadcast({ type: 'post', post });
-    json(res, 200, { ok: true, post, spent_today: spentToday(user.id) });
+    const post = await makeAiPost({ user, room, aiChar, instruction });
+    json(res, 200, { ok: true, post: publicPost(post), spent_today: spentToday(user.id) });
   } finally {
     genLocks.delete(room.id);
     broadcast({ type: 'ai_typing', room_id: room.id, ai_char_id: aiChar.id, on: false });
@@ -607,13 +788,16 @@ route('GET', '/api/settings', async (req, res) => {
     app_title: getSetting('app_title', 'Таверна'),
     default_daily_limit_usd: getSetting('default_daily_limit_usd', '1'),
     chronicle_model: getSetting('chronicle_model', 'anthropic/claude-haiku-5.5'),
+    life_model: getSetting('life_model', ''),
+    image_model: getSetting('image_model', 'google/gemini-2.5-flash-image'),
+    art_style: getSetting('art_style', DEFAULT_ART),
     openrouter_key_set: !!(getSetting('openrouter_key', process.env.OPENROUTER_API_KEY || '')),
   });
 }, { admin: true });
 
 route('PATCH', '/api/settings', async (req, res) => {
   const b = await readBody(req);
-  for (const k of ['app_title', 'default_daily_limit_usd', 'chronicle_model', 'openrouter_key']) {
+  for (const k of ['app_title', 'default_daily_limit_usd', 'chronicle_model', 'openrouter_key', 'life_model', 'image_model', 'art_style']) {
     if (b[k] != null && String(b[k]).length) setSetting(k, String(b[k]));
   }
   json(res, 200, { ok: true });

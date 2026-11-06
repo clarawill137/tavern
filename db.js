@@ -169,6 +169,23 @@ addCol('personas', `realism INTEGER NOT NULL DEFAULT 0`);    // симсовск
 addCol('worlds', `map TEXT NOT NULL DEFAULT ''`);            // картинка карты мира
 addCol('rooms', `map_x REAL`);                               // метка на карте, % по ширине
 addCol('rooms', `map_y REAL`);
+// ---- Life (v4) ----
+addCol('worlds', `hours REAL NOT NULL DEFAULT 8`);           // время истории в часах с начала (тают потребности)
+addCol('worlds', `clock TEXT NOT NULL DEFAULT ''`);          // «пятница, 23:40» — как его видит Летописец
+addCol('worlds', `art_style TEXT NOT NULL DEFAULT ''`);      // стиль картинок мира
+addCol('rooms', `scene TEXT NOT NULL DEFAULT '{}'`);         // тон, близость, авто-оценка Летописца
+addCol('rooms', `chron_on INTEGER NOT NULL DEFAULT -1`);     // -1 авто (форум да, чат нет), 0/1 руками
+addCol('posts', `chron TEXT NOT NULL DEFAULT ''`);           // что изменилось + снимок для отката
+addCol('items', `owner_key TEXT`);                           // 'p12' / 'a3' — у кого вещь
+addCol('items', `story TEXT NOT NULL DEFAULT '[]'`);         // история вещи
+addCol('items', `from_key TEXT NOT NULL DEFAULT ''`);        // кто подарил
+db.exec(`UPDATE items SET owner_key = 'p' || persona_id WHERE owner_key IS NULL`);
+db.exec(`
+CREATE TABLE IF NOT EXISTS life_prof (key TEXT PRIMARY KEY, data TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS life_state (world_id INTEGER NOT NULL, key TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (world_id, key));
+CREATE TABLE IF NOT EXISTS life_rel (world_id INTEGER NOT NULL, from_key TEXT NOT NULL, to_key TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (world_id, from_key, to_key));
+CREATE INDEX IF NOT EXISTS idx_items_owner ON items(owner_key);
+`);
 
 // дефолтный мир + перенос старого общего промпта мира
 if (db.prepare('SELECT COUNT(*) AS n FROM worlds').get().n === 0) {
@@ -218,13 +235,13 @@ const q = {
   allWorlds: db.prepare('SELECT * FROM worlds WHERE archived = 0 ORDER BY position, id'),
   worldById: db.prepare('SELECT * FROM worlds WHERE id = ?'),
   insertWorld: db.prepare('INSERT INTO worlds(title, emoji, cover, prompt, accent, position) VALUES (?,?,?,?,?,?)'),
-  updateWorld: db.prepare('UPDATE worlds SET title=?, emoji=?, cover=?, prompt=?, accent=?, position=?, archived=?, map=? WHERE id=?'),
+  updateWorld: db.prepare('UPDATE worlds SET title=?, emoji=?, cover=?, prompt=?, accent=?, position=?, archived=?, map=?, art_style=? WHERE id=?'),
 
   allRooms: db.prepare('SELECT * FROM rooms WHERE archived = 0 ORDER BY category, position, id'),
   roomsByWorld: db.prepare('SELECT * FROM rooms WHERE world_id = ? AND archived = 0 ORDER BY category, position, id'),
   roomById: db.prepare('SELECT * FROM rooms WHERE id = ?'),
   insertRoom: db.prepare('INSERT INTO rooms(world_id, title, kind, category, description, cover, position) VALUES (?,?,?,?,?,?,?)'),
-  updateRoom: db.prepare(`UPDATE rooms SET title=?, kind=?, category=?, description=?, cover=?, auto_ai_char_id=?, position=?, archived=?, map_x=?, map_y=? WHERE id=?`),
+  updateRoom: db.prepare(`UPDATE rooms SET title=?, kind=?, category=?, description=?, cover=?, auto_ai_char_id=?, position=?, archived=?, map_x=?, map_y=?, chron_on=? WHERE id=?`),
   setChronicle: db.prepare('UPDATE rooms SET chronicle=?, chronicle_at=? WHERE id=?'),
 
   roomAi: db.prepare('SELECT ai_char_id FROM room_ai WHERE room_id = ?'),
@@ -243,12 +260,36 @@ const q = {
   lastPostPreviews: db.prepare(`SELECT room_id, body, persona_id, ai_char_id FROM posts
                                 WHERE deleted = 0 AND id IN (SELECT MAX(id) FROM posts WHERE deleted = 0 GROUP BY room_id)`),
 
-  itemsByPersona: db.prepare('SELECT * FROM items WHERE persona_id = ? ORDER BY kind, id'),
+  itemsByOwner: db.prepare('SELECT * FROM items WHERE owner_key = ? ORDER BY kind, id'),
   itemById: db.prepare('SELECT * FROM items WHERE id = ?'),
-  insertItem: db.prepare('INSERT INTO items(persona_id, kind, name, descr, image, equipped, created_at) VALUES (?,?,?,?,?,?,?)'),
-  updateItem: db.prepare('UPDATE items SET kind=?, name=?, descr=?, image=?, equipped=? WHERE id=?'),
+  insertItem: db.prepare(`INSERT INTO items(persona_id, owner_key, kind, name, descr, image, equipped, story, from_key, created_at)
+                          VALUES (?,?,?,?,?,?,?,?,?,?)`),
+  updateItem: db.prepare('UPDATE items SET kind=?, name=?, descr=?, image=?, equipped=?, story=?, from_key=?, owner_key=? WHERE id=?'),
   deleteItem: db.prepare('DELETE FROM items WHERE id=?'),
-  equippedByPersona: db.prepare('SELECT * FROM items WHERE persona_id = ? AND equipped = 1 ORDER BY kind, id'),
+  unequipLooks: db.prepare(`UPDATE items SET equipped = 0 WHERE owner_key = ? AND kind = 'образ'`),
+  restoreItem: db.prepare(`INSERT OR REPLACE INTO items(id, persona_id, owner_key, kind, name, descr, image, equipped, story, from_key, created_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?)`),
+  deleteItemsOfOwner: db.prepare('DELETE FROM items WHERE owner_key = ?'),
+
+  getProf: db.prepare('SELECT data FROM life_prof WHERE key = ?'),
+  setProf: db.prepare(`INSERT INTO life_prof(key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data`),
+  getState: db.prepare('SELECT data FROM life_state WHERE world_id = ? AND key = ?'),
+  setState: db.prepare(`INSERT INTO life_state(world_id, key, data) VALUES (?,?,?) ON CONFLICT(world_id, key) DO UPDATE SET data = excluded.data`),
+  delState: db.prepare('DELETE FROM life_state WHERE world_id = ? AND key = ?'),
+  getRel: db.prepare('SELECT data FROM life_rel WHERE world_id = ? AND from_key = ? AND to_key = ?'),
+  setRel: db.prepare(`INSERT INTO life_rel(world_id, from_key, to_key, data) VALUES (?,?,?,?)
+                      ON CONFLICT(world_id, from_key, to_key) DO UPDATE SET data = excluded.data`),
+  delRel: db.prepare('DELETE FROM life_rel WHERE world_id = ? AND from_key = ? AND to_key = ?'),
+  relsOf: db.prepare('SELECT * FROM life_rel WHERE world_id = ? AND (from_key = ? OR to_key = ?)'),
+  setWorldTime: db.prepare('UPDATE worlds SET hours = ?, clock = ? WHERE id = ?'),
+  setRoomScene: db.prepare('UPDATE rooms SET scene = ? WHERE id = ?'),
+  setPostChron: db.prepare('UPDATE posts SET chron = ? WHERE id = ?'),
+  latestChronInWorld: db.prepare(`SELECT p.id FROM posts p JOIN rooms r ON r.id = p.room_id
+                                  WHERE r.world_id = ? AND p.chron != '' AND p.deleted = 0 ORDER BY p.id DESC LIMIT 1`),
+  lastPostOfAuthorInWorld: db.prepare(`SELECT p.room_id, p.created_at FROM posts p JOIN rooms r ON r.id = p.room_id
+                                       WHERE r.world_id = ? AND p.deleted = 0 AND p.is_ooc = 0 AND r.kind = 'forum'
+                                       AND ((? = 'p' AND p.persona_id = ?) OR (? = 'a' AND p.ai_char_id = ?))
+                                       ORDER BY p.id DESC LIMIT 1`),
 
   aiChars: db.prepare('SELECT * FROM ai_chars WHERE deleted = 0 ORDER BY id'),
   aiCharById: db.prepare('SELECT * FROM ai_chars WHERE id = ?'),
