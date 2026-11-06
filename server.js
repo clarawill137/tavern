@@ -5,7 +5,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { q, now, getSetting, setSetting, DATA_DIR } = require('./db');
-const { aiPost, chronicle, spentToday, dailyLimitFor, queueLifeChron, undoLifeChron, fillFromCard, draw, DEFAULT_ART } = require('./ai');
+const { aiPost, chronicle, spentToday, dailyLimitFor, queueLifeChron, undoLifeChron, fillFromCard, draw, DEFAULT_ART, makeRumors, makeCut } = require('./ai');
 const life = require('./life');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
@@ -81,7 +81,13 @@ const genLocks = new Set();
 // Летописец после поста: по очереди в мире, траты — на того, кто запостил/позвал
 function lifeAfter(post, user) {
   return queueLifeChron({ user, post })
-    .then(r => { if (r) broadcast({ type: 'chron', room_id: r.room_id, world_id: r.world_id, post_id: r.post_id, chips: r.chips }); return r; })
+    .then(r => {
+      if (!r) return r;
+      broadcast({ type: 'chron', room_id: r.room_id, world_id: r.world_id, post_id: r.post_id, chips: r.chips });
+      // новый день истории — свежие новости и слухи (в фоне, на того же игрока)
+      if (r.new_day) makeRumors({ user, worldId: r.world_id }).then(() => broadcast({ type: 'world_life', world_id: r.world_id, what: 'rumors' })).catch(e => console.warn('слухи:', e.message));
+      return r;
+    })
     .catch(e => { broadcast({ type: 'chron_error', room_id: post.room_id, message: e.message }); return null; });
 }
 
@@ -118,7 +124,8 @@ async function autoAiReply(room, user, chronDone) {
 const routes = [];
 function route(method, pattern, handler, { admin = false, open = false } = {}) {
   const keys = [];
-  const rx = new RegExp('^' + pattern.replace(/([:@])(\w+)/g, (_, s, k) => { keys.push((s === '@' ? '@' : '') + k); return s === '@' ? '([pa])' : '(\\d+)'; }) + '$');
+  // :id — число, @t — p|a, *uid — строка
+  const rx = new RegExp('^' + pattern.replace(/([:@*])(\w+)/g, (_, s, k) => { keys.push((s === ':' ? '' : '@') + k); return s === '@' ? '([pa])' : s === '*' ? '([\\w-]+)' : '(\\d+)'; }) + '$');
   routes.push({ method, rx, keys, handler, admin, open });
 }
 
@@ -278,7 +285,7 @@ function lifeView(user, c, W) {
     char: { key: c.key, t: c.t, id: c.id, name: c.name, ai: c.ai, user_id: c.user_id, avatar: c.avatar, emoji: c.emoji, color: c.color, bio: c.ai ? '' : c.bio },
     can_edit: canEdit(user, c), can_see: seeInner, world_id: W,
     prof: { card: p.card, likes: p.likes, dislikes: p.dislikes, hobbies: p.hobbies, facts: p.facts, fem: p.fem, share: p.share },
-    outfit: x.outfit, state_label: life.stateLabel(x, p),
+    outfit: x.outfit, state_label: life.stateLabel(x, p), home: life.wl(W).homes[c.key] || null,
     location: loc ? { room_id: loc.room_id, at: loc.created_at } : null,
     items: seeInner || canEdit(user, c) ? items : items.filter(i => i.kind === 'образ' || i.equipped),
   };
@@ -346,6 +353,7 @@ route('PATCH', '/api/life/@t/:id/state', async (req, res, { params, user }) => {
   if (b.body && typeof b.body === 'object') for (const [k] of life.NEEDS) if (typeof b.body[k] === 'number') life.setNeed(x, k, b.body[k], h);
   if (b.state !== undefined) x.state = b.state && life.STATES.some(s => s[0] === b.state) ? { id: b.state, why: life.cut(b.why || '', 60), manual: true } : null;
   if (typeof b.outfit === 'string') x.outfit = life.cut(b.outfit, 300);
+  if (b.home !== undefined) { const d = life.wl(W); if (q.roomById.get(b.home || 0)?.world_id === W) d.homes[c.key] = b.home; else delete d.homes[c.key]; life.saveWl(W, d); }
   if (b.wound_del != null) x.wounds = x.wounds.filter(w => w.id !== b.wound_del);
   if (b.wound_add) x.wounds.push({ id: ++x.seq, t: life.cut(b.wound_add, 50), at: h });
   for (const f of ['thoughts', 'wants']) {
@@ -486,6 +494,179 @@ route('POST', '/api/draw', async (req, res, { user }) => {
   const refs = Array.isArray(b.refs) ? b.refs.filter(u => typeof u === 'string' && u.startsWith('/uploads/')) : [];
   const url = await draw({ user, prompt: life.cut(b.prompt, 3000), aspect, refs, worldId: b.world_id || null });
   json(res, 200, { ok: true, url, spent_today: spentToday(user.id) });
+});
+
+// ----- мир вокруг: следы, питомцы, треугольники, слухи, кат-сцены -----
+function wlView(user, W) {
+  const d = life.wl(W);
+  const nm = (k) => { const c = life.charInfo(k); return c ? { key: k, name: c.name, avatar: c.avatar, emoji: c.emoji, ai: c.ai } : null; };
+  return {
+    traces: d.traces,
+    pets: d.pets.map(p => life.petView(W, p)),
+    tris: d.tris.map(t => ({ ...t, heat: life.triHeat(W, t), people: t.who.map(nm).filter(Boolean), can_edit: !!(user.is_admin || t.by === user.id || t.who.some(k => canEdit(user, life.charInfo(k)))) })),
+    rumors: d.rumors, push: d.push, homes: d.homes,
+    cuts: d.cuts.map(c => ({ id: c.id, post_id: c.post_id, room_id: c.room_id, title: c.title, at: c.at, by: c.by, frames: c.frames })),
+    meta: { pet_kinds: Object.fromEntries(Object.entries(life.PET_KINDS).map(([k, v]) => [k, v.label])), tri_kinds: life.TRI_KINDS.map(k => k.slice(0, 3)), tri_ends: life.TRI_ENDS.map(k => k.slice(0, 2)) },
+  };
+}
+const wlChanged = (W, what) => broadcast({ type: 'world_life', world_id: W, what });
+function worldOr404(res, id) { const w = q.worldById.get(id); if (!w) { err(res, 404, 'Нет мира'); return null; } return w; }
+
+route('GET', '/api/worlds/:id/life', async (req, res, { params, user }) => {
+  if (!worldOr404(res, params.id)) return;
+  json(res, 200, wlView(user, params.id));
+});
+
+// следы
+route('POST', '/api/worlds/:id/traces', async (req, res, { params }) => {
+  if (!worldOr404(res, params.id)) return;
+  const b = await readBody(req);
+  const room = q.roomById.get(b.room_id || 0);
+  if (!room || room.world_id !== params.id) return err(res, 400, 'Где?');
+  if (!String(b.text || '').trim()) return err(res, 400, 'Что за след?');
+  const d = life.wl(params.id);
+  life.addTrace(d, room.id, { t: b.text, k: b.kind });
+  life.saveWl(params.id, d); wlChanged(params.id, 'traces');
+  json(res, 200, { ok: true });
+});
+route('DELETE', '/api/worlds/:id/traces/:room/*tid', async (req, res, { params }) => {
+  const d = life.wl(params.id);
+  const arr = d.traces[params.room] || [];
+  d.traces[params.room] = arr.filter(t => t.id !== params.tid);
+  life.saveWl(params.id, d); wlChanged(params.id, 'traces');
+  json(res, 200, { ok: true });
+});
+
+// питомцы — общие на компанию: заводить и кормить может любой
+const PET_ACT = { feed: ['food', 100], play: ['play', 100], pet: ['love', 45] };
+route('POST', '/api/worlds/:id/pets', async (req, res, { params }) => {
+  if (!worldOr404(res, params.id)) return;
+  const b = await readBody(req);
+  if (!String(b.name || '').trim()) return err(res, 400, 'Кличка?');
+  const d = life.wl(params.id);
+  const home = q.roomById.get(b.home || 0)?.world_id === params.id ? b.home : null;
+  const p = life.newPet(params.id, d, { name: b.name, kind: b.kind, look: b.look || '', home });
+  if (b.img) p.img = String(b.img);
+  if (Array.isArray(b.traits)) p.traits = b.traits.map(t => life.cut(t, 30)).filter(Boolean).slice(0, 8);
+  life.saveWl(params.id, d); wlChanged(params.id, 'pets');
+  json(res, 200, { ok: true, id: p.id });
+});
+route('PATCH', '/api/worlds/:id/pets/*pid', async (req, res, { params }) => {
+  const d = life.wl(params.id);
+  const p = d.pets.find(x => x.id === params.pid);
+  if (!p) return err(res, 404, 'Нет питомца');
+  const b = await readBody(req);
+  const h = life.worldHours(params.id);
+  if (b.act && PET_ACT[b.act]) { const [k, v] = PET_ACT[b.act]; life.setPetNeed(p, k, b.act === 'pet' ? life.petNeed(p, k, h) + v : v, h); }
+  if (b.name) p.name = life.cut(b.name, 40);
+  if (b.kind && life.PET_KINDS[b.kind]) p.kind = b.kind;
+  if (typeof b.look === 'string') p.look = life.cut(b.look, 200);
+  if (typeof b.img === 'string') p.img = b.img;
+  if (b.home !== undefined) p.home = q.roomById.get(b.home || 0)?.world_id === params.id ? b.home : null;
+  if (Array.isArray(b.traits)) p.traits = b.traits.map(t => life.cut(t, 30)).filter(Boolean).slice(0, 8);
+  if (typeof b.fav === 'string') p.favName = life.cut(b.fav, 40);
+  if (typeof b.on === 'boolean') p.on = b.on;
+  if (b.healed) { p.hurt = ''; life.setPetNeed(p, 'health', 100, h); }
+  life.saveWl(params.id, d); wlChanged(params.id, 'pets');
+  json(res, 200, { ok: true });
+});
+route('DELETE', '/api/worlds/:id/pets/*pid', async (req, res, { params }) => {
+  const d = life.wl(params.id);
+  d.pets = d.pets.filter(x => x.id !== params.pid);
+  life.saveWl(params.id, d); wlChanged(params.id, 'pets');
+  json(res, 200, { ok: true });
+});
+
+// треугольники — заводит хозяин любого из троих или админ
+function triBody(b, t) {
+  const who = Array.isArray(b.who) ? [...new Set(b.who.filter(k => life.charInfo(k)))] : t.who;
+  if (who.length !== 3) return null;
+  return {
+    ...t, who,
+    center: who.includes(b.center) ? b.center : who.includes(t.center) ? t.center : who[0],
+    kind: life.TRI_KINDS.some(k => k[0] === b.kind) ? b.kind : t.kind || 'jeal',
+    end: life.TRI_ENDS.some(k => k[0] === b.end) ? b.end : t.end || 'hold',
+    note: b.note !== undefined ? life.cut(b.note, 200) : t.note || '',
+    on: typeof b.on === 'boolean' ? b.on : t.on !== false,
+  };
+}
+const canTri = (user, who) => user.is_admin || who.some(k => canEdit(user, life.charInfo(k)));
+route('POST', '/api/worlds/:id/tris', async (req, res, { params, user }) => {
+  if (!worldOr404(res, params.id)) return;
+  const b = await readBody(req);
+  const t = triBody(b, { id: life.uid(), by: user.id, at: now() });
+  if (!t) return err(res, 400, 'Нужны ровно трое');
+  if (!canTri(user, t.who)) return err(res, 403, 'В треугольнике должен быть твой персонаж');
+  const d = life.wl(params.id); d.tris.push(t);
+  life.saveWl(params.id, d); wlChanged(params.id, 'tris');
+  json(res, 200, { ok: true, id: t.id });
+});
+route('PATCH', '/api/worlds/:id/tris/*tid', async (req, res, { params, user }) => {
+  const d = life.wl(params.id);
+  const i = d.tris.findIndex(x => x.id === params.tid);
+  if (i < 0) return err(res, 404, 'Нет треугольника');
+  if (!canTri(user, d.tris[i].who) && d.tris[i].by !== user.id) return err(res, 403, 'Нельзя');
+  const t = triBody(await readBody(req), d.tris[i]);
+  if (!t) return err(res, 400, 'Нужны ровно трое');
+  d.tris[i] = t;
+  life.saveWl(params.id, d); wlChanged(params.id, 'tris');
+  json(res, 200, { ok: true });
+});
+route('DELETE', '/api/worlds/:id/tris/*tid', async (req, res, { params, user }) => {
+  const d = life.wl(params.id);
+  const t = d.tris.find(x => x.id === params.tid);
+  if (!t) return err(res, 404, 'Нет треугольника');
+  if (!canTri(user, t.who) && t.by !== user.id) return err(res, 403, 'Нельзя');
+  d.tris = d.tris.filter(x => x.id !== params.tid);
+  life.saveWl(params.id, d); wlChanged(params.id, 'tris');
+  json(res, 200, { ok: true });
+});
+
+// новости и слухи
+route('POST', '/api/worlds/:id/rumors', async (req, res, { params, user }) => {
+  if (!worldOr404(res, params.id)) return;
+  const r = await makeRumors({ user, worldId: params.id });
+  wlChanged(params.id, 'rumors');
+  json(res, 200, { ok: true, rumors: r, spent_today: spentToday(user.id) });
+});
+// подкинуть слух в сцену: ИИ упомянет его в ближайшем ответе в этой комнате
+route('POST', '/api/rooms/:id/rumor', async (req, res, { params }) => {
+  const room = q.roomById.get(params.id);
+  if (!room) return err(res, 404, 'Нет комнаты');
+  const b = await readBody(req);
+  const d = life.wl(room.world_id);
+  if (String(b.text || '').trim()) d.push[room.id] = life.cut(b.text, 400); else delete d.push[room.id];
+  life.saveWl(room.world_id, d); wlChanged(room.world_id, 'push');
+  json(res, 200, { ok: true });
+});
+
+// кат-сцена по посту: раскадровка + 3 кадра
+const cutLocks = new Set();
+route('POST', '/api/posts/:id/cut', async (req, res, { params, user }) => {
+  const p = q.postById.get(params.id);
+  if (!p || p.deleted || !String(p.body || '').trim()) return err(res, 404, 'Нет поста');
+  if (cutLocks.has(p.id)) return err(res, 409, 'Кат-сцена уже снимается');
+  const room = q.roomById.get(p.room_id);
+  cutLocks.add(p.id);
+  broadcast({ type: 'cut_progress', room_id: p.room_id, post_id: p.id, step: 0, of: 3 });
+  try {
+    const cut = await makeCut({ user, post: p, onStep: (k, n) => broadcast({ type: 'cut_progress', room_id: p.room_id, post_id: p.id, step: k, of: n }) });
+    wlChanged(room.world_id, 'cuts');
+    broadcast({ type: 'cut', room_id: p.room_id, post_id: p.id, cut_id: cut.id });
+    json(res, 200, { ok: true, cut, spent_today: spentToday(user.id) });
+  } catch (e) {
+    broadcast({ type: 'cut_progress', room_id: p.room_id, post_id: p.id, step: -1 });
+    throw e;
+  } finally { cutLocks.delete(p.id); }
+});
+route('DELETE', '/api/worlds/:id/cuts/*cid', async (req, res, { params, user }) => {
+  const d = life.wl(params.id);
+  const c = d.cuts.find(x => x.id === params.cid);
+  if (!c) return err(res, 404, 'Нет кат-сцены');
+  if (c.by !== user.id && !user.is_admin) return err(res, 403, 'Удалить может тот, кто снимал, или админ');
+  d.cuts = d.cuts.filter(x => x.id !== params.cid);
+  life.saveWl(params.id, d); wlChanged(params.id, 'cuts');
+  json(res, 200, { ok: true });
 });
 
 // ----- миры -----

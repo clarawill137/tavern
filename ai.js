@@ -190,7 +190,7 @@ async function runLifeChron({ user, post }) {
   const res = life.apply(fresh, post, j, cast);
   const rec = { chips: res.chips, at: now(), cost: r.cost_usd, snap };
   q.setPostChron.run(JSON.stringify(rec), post.id);
-  return { chips: res.chips, room_id: room.id, world_id: room.world_id, post_id: post.id };
+  return { chips: res.chips, room_id: room.id, world_id: room.world_id, post_id: post.id, new_day: life.newDay(room.world_id) };
 }
 
 function queueLifeChron({ user, post, force = false }) {
@@ -217,11 +217,18 @@ const FILL_SYSTEM = `Ты помогаешь оживить персонажа �
 {"fem":false,"metab":1,"hobbies":[],"turnons":[],"likes":[],"dislikes":[],"romance":{"level":"off|some|lots","rel":"с кем и кто они друг другу, коротко","style":"как именно он ухаживает, 8–20 слов"},"thoughts":[{"t":"что его тяготит, 6–14 слов","w":1}],"wants":[{"t":"его собственное желание не про игроков, 6–14 слов","with":""}],"card":{"age":"","look":"внешность коротко","traits":"характер коротко"}}
 fem — женщина ли; metab — 1 обычный, 1.5 быстрый, 2 суперсолдат. hobbies — 3–6 увлечений; turnons — 3–6 вещей, что его заводит; likes/dislikes — по 3–6 вкусов (еда, музыка, привычки). w — вес мысли 1–3. Только то, что следует из карточки, без выдумок про сюжет.`;
 
+// Для игроков — только разложить по полочкам то, что они сами написали. Ничего не придумывать.
+const FILL_PLAYER = `Ты раскладываешь анкету персонажа живого игрока по полям. Ничего не придумывай и не додумывай: только то, что прямо написано.
+Ответь только JSON:
+{"fem":false,"hobbies":[],"likes":[],"dislikes":[],"facts":[],"card":{"age":"","look":"","traits":"","story":""}}
+fem — женщина ли (по тексту). hobbies, likes, dislikes — только названные в тексте. facts — до 6 важных фактов о нём из текста, 4–14 слов каждый. card — возраст, внешность, характер, история коротко своими словами из текста. Чего нет в тексте — пусто.`;
+
 async function fillFromCard({ user, key, worldId }) {
   checkLimit(user);
   const c = life.charInfo(key);
   if (!c) { const e = new Error('Нет персонажа'); e.status = 404; throw e; }
   const src = c.ai ? (q.aiCharById.get(c.id)?.system_prompt || '') : c.bio;
+  if (!c.ai) return fillPlayer({ user, c });
   const r = await callOpenRouter({ model: lifeModel(), system: FILL_SYSTEM, userContent: `Персонаж: ${c.name}\n\n${life.cut(src, 12000)}`, temperature: 0.4, max_tokens: 1200 });
   logUsage(user, c.ai ? c.id : null, null, lifeModel(), r, 'life');
   const j = life.parseJson(r.text);
@@ -239,6 +246,20 @@ async function fillFromCard({ user, key, worldId }) {
     for (const t of Array.isArray(j.wants) ? j.wants : []) if (t?.t) x.wants.push({ id: life.uid(), t: life.cut(t.t, 120), with: life.cut(t.with || '', 40), status: 'on', by: 'fill' });
     life.saveState(worldId, key, x);
   }
+  return p;
+}
+
+async function fillPlayer({ user, c }) {
+  if (!String(c.bio || '').trim()) { const e = new Error('Сначала напиши «Кто это» — заполняю только по твоему тексту'); e.status = 400; throw e; }
+  const r = await callOpenRouter({ model: lifeModel(), system: FILL_PLAYER, userContent: `Персонаж: ${c.name}\n\n${life.cut(c.bio, 12000)}`, temperature: 0.2, max_tokens: 900 });
+  logUsage(user, null, null, lifeModel(), r, 'life');
+  const j = life.parseJson(r.text);
+  if (!j) { const e = new Error('Модель вернула не JSON'); e.status = 502; throw e; }
+  const p = life.prof(c.key);
+  if (typeof j.fem === 'boolean') p.fem = j.fem;
+  for (const f of ['hobbies', 'likes', 'dislikes', 'facts']) if (Array.isArray(j[f]) && j[f].length) p[f] = [...new Set([...p[f], ...j[f].map(s => life.cut(s, f === 'facts' ? 120 : 40))])].slice(-20);
+  if (j.card && typeof j.card === 'object') for (const f of ['age', 'look', 'traits', 'story']) if (j.card[f] && !p.card[f]) p.card[f] = life.cut(j.card[f], f === 'story' ? 1200 : 300);
+  life.saveProf(c.key, p);
   return p;
 }
 
@@ -284,7 +305,50 @@ async function draw({ user, prompt, aspect = '1:1', refs = [], worldId = null })
   return `/uploads/${name}`;
 }
 
+// ───────────── новости и слухи мира ─────────────
+
+const rumorBusy = new Set();
+async function makeRumors({ user, worldId }) {
+  if (rumorBusy.has(worldId)) { const e = new Error('Слухи уже собираются'); e.status = 409; throw e; }
+  checkLimit(user);
+  rumorBusy.add(worldId);
+  try {
+    const model = lifeModel();
+    const r = await callOpenRouter({ model, system: life.RUMORS_SYSTEM, userContent: life.rumorsInput(worldId), temperature: 0.8, max_tokens: 1600 });
+    logUsage(user, null, null, model, r, 'life');
+    return life.saveRumors(worldId, life.parseJson(r.text));
+  } finally { rumorBusy.delete(worldId); }
+}
+
+// ───────────── кат-сцена: 3 кадра по посту ─────────────
+
+async function makeCut({ user, post, onStep }) {
+  const room = q.roomById.get(post.room_id);
+  if (!room) { const e = new Error('Нет комнаты'); e.status = 404; throw e; }
+  checkLimit(user);
+  const { text, cast } = life.cutInput(room, post);
+  const model = lifeModel();
+  const r = await callOpenRouter({ model, system: life.CUT_SYSTEM, userContent: text, temperature: 0.5, max_tokens: 1600 });
+  logUsage(user, null, room.id, model, r, 'life');
+  const j = life.parseJson(r.text);
+  const frames = (j?.frames || []).filter(f => f?.prompt).slice(0, 3);
+  if (!frames.length) { const e = new Error('Раскадровка не вышла'); e.status = 502; throw e; }
+  const map = life.namesMap(cast);
+  const cutObj = { id: life.uid(), post_id: post.id, room_id: room.id, title: life.cut(j.title || 'Кат-сцена', 40), at: now(), by: user.id, frames: [] };
+  for (let k = 0; k < frames.length; k++) {
+    onStep?.(k + 1, frames.length);
+    const f = frames[k];
+    const refs = (Array.isArray(f.who) ? f.who : []).map(n => life.findC(map, n)?.avatar).filter(u => u && u.startsWith('/uploads/')).slice(0, 2);
+    const img = await draw({ user, prompt: `${f.prompt}\nCinematic 16:9 film still, shallow depth of field, no letterbox.`, aspect: '16:9', refs, worldId: room.world_id });
+    cutObj.frames.push({ title: life.cut(f.title || '', 30), caption: life.cut(f.caption || '', 120), img });
+  }
+  const d = life.wl(room.world_id);
+  d.cuts = [...d.cuts.filter(c => c.post_id !== post.id), cutObj].slice(-60);
+  life.saveWl(room.world_id, d);
+  return cutObj;
+}
+
 module.exports = {
   aiPost, chronicle, spentToday, dailyLimitFor, checkLimit,
-  queueLifeChron, undoLifeChron, chronEnabled, fillFromCard, draw, DEFAULT_ART,
+  queueLifeChron, undoLifeChron, chronEnabled, fillFromCard, draw, DEFAULT_ART, makeRumors, makeCut,
 };

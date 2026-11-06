@@ -185,6 +185,7 @@ CREATE TABLE IF NOT EXISTS life_prof (key TEXT PRIMARY KEY, data TEXT NOT NULL D
 CREATE TABLE IF NOT EXISTS life_state (world_id INTEGER NOT NULL, key TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (world_id, key));
 CREATE TABLE IF NOT EXISTS life_rel (world_id INTEGER NOT NULL, from_key TEXT NOT NULL, to_key TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (world_id, from_key, to_key));
 CREATE INDEX IF NOT EXISTS idx_items_owner ON items(owner_key);
+CREATE TABLE IF NOT EXISTS life_world (world_id INTEGER PRIMARY KEY, data TEXT NOT NULL DEFAULT '{}');
 `);
 
 // дефолтный мир + перенос старого общего промпта мира
@@ -284,6 +285,10 @@ const q = {
   setWorldTime: db.prepare('UPDATE worlds SET hours = ?, clock = ? WHERE id = ?'),
   setRoomScene: db.prepare('UPDATE rooms SET scene = ? WHERE id = ?'),
   setPostChron: db.prepare('UPDATE posts SET chron = ? WHERE id = ?'),
+  getWorldLife: db.prepare('SELECT data FROM life_world WHERE world_id = ?'),
+  setWorldLife: db.prepare(`INSERT INTO life_world(world_id, data) VALUES (?, ?) ON CONFLICT(world_id) DO UPDATE SET data = excluded.data`),
+  recentChronInWorld: db.prepare(`SELECT p.id, p.room_id, p.chron FROM posts p JOIN rooms r ON r.id = p.room_id
+    WHERE r.world_id = ? AND p.deleted = 0 AND p.chron != '' ORDER BY p.id DESC LIMIT ?`),
   latestChronInWorld: db.prepare(`SELECT p.id FROM posts p JOIN rooms r ON r.id = p.room_id
                                   WHERE r.world_id = ? AND p.chron != '' AND p.deleted = 0 ORDER BY p.id DESC LIMIT 1`),
   lastPostOfAuthorInWorld: db.prepare(`SELECT p.room_id, p.created_at FROM posts p JOIN rooms r ON r.id = p.room_id

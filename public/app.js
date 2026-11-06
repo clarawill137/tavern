@@ -5,6 +5,8 @@ import { icon, CANDLE } from './icons.js';
 const $app = document.getElementById('app');
 let S = null, META = null;
 const BRIEF = {};              // world_id → { clock, chars: { key: { room_id, at, outfit, state } } }
+const WL = {};                 // world_id → следы, питомцы, треугольники, слухи, кат-сцены
+const CUTBUSY = {};            // post_id → { step, of } — кат-сцена снимается
 let curRoom = null, posts = [];
 let composer = { persona_id: null, ooc: false, image: '' };
 let tab = 'rooms';
@@ -92,6 +94,13 @@ async function loadBrief(wid = curWorldId, force = false) {
   if (!BRIEF[wid] || force) { try { BRIEF[wid] = await api(`/api/worlds/${wid}/brief`); } catch { BRIEF[wid] = { chars: {} }; } }
   return BRIEF[wid];
 }
+async function loadWL(wid = curWorldId, force = false) {
+  if (!wid) return null;
+  if (!WL[wid] || force) { try { WL[wid] = await api(`/api/worlds/${wid}/life`); } catch { WL[wid] = { traces: {}, pets: [], tris: [], rumors: null, push: {}, homes: {}, cuts: [], meta: { pet_kinds: {}, tri_kinds: [], tri_ends: [] } }; } }
+  return WL[wid];
+}
+const wl = () => WL[curWorldId] || { traces: {}, pets: [], tris: [], rumors: null, push: {}, homes: {}, cuts: [], meta: { pet_kinds: {}, tri_kinds: [], tri_ends: [] } };
+const cutOf = (postId) => wl().cuts.find(c => c.post_id === postId) || null;
 const hereIn = (roomId) => Object.entries(BRIEF[curWorldId]?.chars || {}).filter(([, v]) => v.room_id === roomId).map(([k]) => charBy(k)).filter(Boolean);
 
 // ───────────── картинки ─────────────
@@ -179,8 +188,23 @@ function connectSSE() {
       if (curRoom?.id === ev.room_id) toast('ИИ: ' + ev.message, true);
     } else if (ev.type === 'chron') {
       if (curRoom?.id === ev.room_id) { const p = posts.find(p => p.id === ev.post_id); if (p) { p.chron = ev.chips ? { chips: ev.chips } : null; replacePost(p); } }
-      if (ev.world_id) loadBrief(ev.world_id, true);
+      const wid = ev.world_id || S.rooms.find(r => r.id === ev.room_id)?.world_id;
+      if (wid) { loadBrief(wid, true); loadWL(wid, true).then(() => { if (curRoom?.world_id === wid) updateRoomHere(); }); }
       if (openCard) refreshCard();
+    } else if (ev.type === 'world_life') {
+      loadWL(ev.world_id, true).then(() => {
+        if (curRoom?.world_id === ev.world_id) { updateRoomHere(); if (ev.what === 'cuts') posts.forEach(p => { if (cutOf(p.id)) replacePost(p); }); }
+        else if (!curRoom && !document.querySelector('.lf-overlay') && ev.world_id === curWorldId && ['map', 'chars'].includes(tab)) renderTabs();
+        if (openCard) refreshCard();
+        const ps = document.querySelector('.lf-sheet[data-pet]'); if (ps) petSheet(ps.dataset.pet);
+      });
+    } else if (ev.type === 'cut_progress') {
+      if (ev.step < 0) delete CUTBUSY[ev.post_id]; else CUTBUSY[ev.post_id] = { step: ev.step, of: ev.of };
+      const p = posts.find(p => p.id === ev.post_id); if (p) replacePost(p);
+    } else if (ev.type === 'cut') {
+      delete CUTBUSY[ev.post_id];
+      const wid = S.rooms.find(r => r.id === ev.room_id)?.world_id;
+      loadWL(wid, true).then(() => { const p = posts.find(p => p.id === ev.post_id); if (p) replacePost(p); });
     } else if (ev.type === 'chron_error') {
       if (curRoom?.id === ev.room_id && S.me.is_admin) toast('Летописец: ' + ev.message, true);
     } else if (ev.type === 'scene') {
@@ -216,7 +240,7 @@ async function route() {
     if (curRoom) {
       curWorldId = curRoom.world_id; localStorage.setItem('tavern_world', curWorldId);
       posts = (await api(`/api/rooms/${curRoom.id}/posts?limit=50`)).posts;
-      loadBrief();
+      loadBrief(); await loadWL();
     }
   }
   render();
@@ -268,7 +292,7 @@ function renderLogin(mode = 'login') {
 // ───────────── табы ─────────────
 const TABS = [['rooms', 'scene', 'Истории'], ['chars', 'users', 'Персонажи'], ['map', 'map', 'Мир'], ['settings', 'settings', 'Настройки']];
 async function renderTabs() {
-  await loadBrief();
+  await Promise.all([loadBrief(), loadWL()]);
   const w = world();
   const me = S.my_personas.find(p => p.id === composer.persona_id) || S.my_personas[0];
   const body = tab === 'rooms' ? roomsTab() : tab === 'chars' ? charsTab() : tab === 'map' ? mapTab() : settingsTab();
@@ -342,7 +366,57 @@ function mapTab() {
       <button class="lf-btn" id="mt-up">${icon('upload')} Своя карта</button>
       ${w.map ? `<button class="lf-btn" id="mt-pins">${icon('pin')} Метки</button>` : ''}</div>` : ''}
     <div class="lf-sec"><span>Места</span><i class="lf-sec-line"></i><small>${rooms.length}</small></div>
-    <div class="lf-chlist">${rooms.map(roomCard).join('') || `<div class="lf-hint-i">Мест пока нет</div>`}</div>`;
+    <div class="lf-chlist">${rooms.map(roomCard).join('') || `<div class="lf-hint-i">Мест пока нет</div>`}</div>
+    ${worldLifeHtml()}`;
+}
+function petCard(p) {
+  const room = S.rooms.find(r => r.id === p.home);
+  return `<button class="lf-petcard" data-pet="${p.id}">${p.img ? fit(p.img) : `<span class="ph">${icon('paw')}</span>`}
+    ${p.urgent.length ? `<span class="need">${esc(p.needs.find(n => n.v < 30)?.word || 'просит')}</span>` : ''}
+    <span class="lf-petcard-t"><b>${esc(p.name)}</b><small>${esc(p.kind_label)}${room ? ` · ${esc(room.title)}` : ''}</small></span></button>`;
+}
+function triFig(t) {
+  const c = t.people.find(x => x.key === t.center) || t.people[0];
+  const sides = t.people.filter(x => x !== c);
+  return `<span class="lf-tri-fig"><svg viewBox="0 0 80 70" aria-hidden="true"><path d="M40 14 L13 56 L67 56 Z"/></svg>
+    <span class="v c">${ava(c)}</span><span class="v l">${ava(sides[0])}</span><span class="v r">${ava(sides[1])}</span></span>`;
+}
+function triCard(t) {
+  const M = wl().meta;
+  const k = M.tri_kinds.find(x => x[0] === t.kind) || M.tri_kinds[0] || ['', '', 'eye'];
+  const e = M.tri_ends.find(x => x[0] === t.end) || M.tri_ends[0] || ['', ''];
+  const c = t.people.find(x => x.key === t.center) || t.people[0];
+  const sides = t.people.filter(x => x !== c).map(x => x.name);
+  return `<button class="lf-tri${t.on === false ? ' off' : ''}" data-tri="${t.id}">${triFig(t)}
+    <span class="lf-tri-t"><b>${esc(sides[0] || '?')} — ${esc(c?.name || '?')} — ${esc(sides[1] || '?')}</b>
+      <small>${icon(k[2])} ${esc(k[1])} · ${esc(e[1])}${t.on === false ? ' · выключен' : ''}</small>
+      <span class="lf-tri-heat"><span>Накал</span><i class="lf-meter"><b style="width:${t.heat}%"></b></i><small>${t.heat}</small></span>
+      ${t.note ? `<span class="lf-tri-note">${esc(cut(t.note, 120))}</span>` : ''}</span></button>`;
+}
+const TRUTH = { 'правда': 'yes', 'полуправда': 'half', 'враньё': 'no' };
+function rumorsHtml(R) {
+  if (!R) return `<div class="lf-hint-i">Слухов пока нет — они сами появятся в новый день истории, или собери их сейчас.</div>`;
+  return `${R.news.map(n => `<div class="lf-news"><h3>${esc(n.title)}</h3><p>${esc(n.text)}</p></div>`).join('')}
+    ${R.rumors.map((r, i) => `<div class="lf-rumor"><q>${esc(r.text)}</q><div class="lf-rumor-f"><small>${icon('ear')} ${esc(r.source)}</small>
+      <button class="lf-truth ${TRUTH[r.truth] || 'half'}" data-truth>${esc(r.truth)}</button><button class="lf-iconbtn sm" data-push="${i}" title="Подкинуть в сцену">${icon('send')}</button></div></div>`).join('')}
+    <div class="lf-hint">Собраны${R.clock ? ` · ${esc(R.clock)}` : ''}. Тап по «правда?» — подсмотреть. ${icon('send')} — подкинуть слух в сцену, ИИ его упомянет.</div>`;
+}
+function worldLifeHtml() {
+  const d = wl();
+  const tris = d.tris;
+  const cuts = d.cuts.slice().reverse();
+  return `
+    <div class="lf-sec"><span>Питомцы</span><i class="lf-sec-line"></i><small>${d.pets.length || ''}</small></div>
+    ${d.pets.length ? `<div class="lf-petgrid">${d.pets.map(petCard).join('')}</div>` : `<div class="lf-hint-i">Питомцев нет. Летописец заведёт сам, если в истории появится кот или пёс.</div>`}
+    <button class="lf-btn ghost full" id="wl-pet" style="margin-top:8px">${icon('plus')} Питомец</button>
+    <div class="lf-sec"><span>Треугольники</span><i class="lf-sec-line"></i><small>${tris.length || ''}</small></div>
+    ${tris.map(triCard).join('') || `<div class="lf-hint-i">Трое, где чувства к одному влияют на другого. Когда все трое в сцене — ИИ держит эту ось.</div>`}
+    <button class="lf-btn ghost full" id="wl-tri">${icon('plus')} Треугольник</button>
+    <div class="lf-sec"><span>Новости и слухи</span><i class="lf-sec-line"></i></div>
+    ${rumorsHtml(d.rumors)}
+    <button class="lf-btn full" id="wl-rumors" data-busy="Собираю слухи…">${icon('ear')} ${d.rumors ? 'Свежие слухи' : 'Собрать слухи'}</button>
+    ${cuts.length ? `<div class="lf-sec"><span>Кат-сцены</span><i class="lf-sec-line"></i><small>${cuts.length}</small></div>
+      <div class="lf-strip">${cuts.map(c => `<button class="lf-cuttile" data-cutplay="${c.id}"><span class="lf-cuttile-img" style="background-image:url('${esc(c.frames[0]?.img || '')}')"></span><span class="lf-cuttile-play">${icon('play')}</span><small>${esc(cut(c.title, 26))}</small></button>`).join('')}</div>` : ''}`;
 }
 function settingsTab() {
   const row = (id, ic, t, s = '') => `<button class="lf-row" id="${id}">${icon(ic)}<span class="lf-grow"><b>${t}</b>${s ? `<small>${s}</small>` : ''}</span>${icon('right')}</button>`;
@@ -364,6 +438,14 @@ function bindTab() {
   document.querySelectorAll('[data-card]').forEach(b => b.onclick = () => openCardSheet(b.dataset.card));
   document.querySelectorAll('[data-pin]').forEach(b => b.onclick = () => { location.hash = `#/room/${b.dataset.pin}`; });
   on('mt-pins', pinsSheet);
+  on('wl-pet', () => petForm());
+  on('wl-tri', () => triSheet());
+  on('wl-rumors', () => busy(document.getElementById('wl-rumors'), async () => { try { const r = await api(`/api/worlds/${curWorldId}/rumors`, { method: 'POST' }); S.spent_today = r.spent_today; await loadWL(curWorldId, true); renderTabs(); } catch (e) { toast(e.message, true); } }));
+  document.querySelectorAll('[data-pet]').forEach(b => b.onclick = () => petSheet(b.dataset.pet));
+  document.querySelectorAll('[data-tri]').forEach(b => b.onclick = () => triSheet(wl().tris.find(t => t.id === b.dataset.tri)));
+  document.querySelectorAll('[data-truth]').forEach(b => b.onclick = () => b.classList.toggle('show'));
+  document.querySelectorAll('[data-cutplay]').forEach(b => b.onclick = () => playCut(wl().cuts.find(c => c.id === b.dataset.cutplay)));
+  document.querySelectorAll('[data-push]').forEach(b => b.onclick = () => pushRumor(wl().rumors.rumors[+b.dataset.push]?.text));
   on('mt-up', () => pickImage(async url => { await api(`/api/worlds/${curWorldId}`, { method: 'PATCH', body: { map: url } }); await refreshState(); renderTabs(); }));
   on('mt-draw', () => busy(document.getElementById('mt-draw'), drawMap));
   document.querySelectorAll('[data-pal]').forEach(b => b.onclick = () => { applyPal(b.dataset.pal); renderTabs(); });
@@ -435,7 +517,7 @@ async function refreshCard(first = false) {
   if (!openCard) return;
   const k = openCard.key;
   let d;
-  try { d = await api(`/api/life/${k[0]}/${k.slice(1)}?world=${curWorldId}`); } catch (e) { return toast(e.message, true); }
+  try { [d] = await Promise.all([api(`/api/life/${k[0]}/${k.slice(1)}?world=${curWorldId}`), loadWL()]); } catch (e) { return toast(e.message, true); }
   if (!openCard || openCard.key !== k) return;
   const keep = document.querySelector('.lf-sheet.full')?.scrollTop || 0;
   const c = d.char;
@@ -465,13 +547,15 @@ function cardBody(d, sub) {
       ${!c.ai && c.bio ? `<div class="lf-sec"><span>Кто это</span><i class="lf-sec-line"></i></div><div class="lf-text">${esc(c.bio)}</div>` : ''}
       <div class="lf-sec"><span>Личность</span><i class="lf-sec-line"></i>${E ? `<button class="lf-link" id="cd-edit">${icon('pencil')} изменить</button>` : ''}</div>
       ${kv.length ? `<dl class="lf-kv">${kv.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('')}</dl>` : `<div class="lf-hint-i">Карточка пока пустая</div>`}
+      ${homeHtml(d)}
       ${p.hobbies.length ? `<div class="lf-sec"><span>Увлечения</span><i class="lf-sec-line"></i></div><div class="lf-chips wrap">${p.hobbies.map(t => `<span class="lf-chip mini">${esc(t)}</span>`).join('')}</div>` : ''}
       ${p.likes.length || p.dislikes.length ? `<div class="lf-sec"><span>Вкусы</span><i class="lf-sec-line"></i><small>замечает Летописец</small></div>
         <div class="lf-chips wrap">${p.likes.map(t => `<span class="lf-chip mini">${icon('heart')} ${esc(t)}</span>`).join('')}${p.dislikes.map(t => `<span class="lf-chip mini" style="opacity:.7">${icon('x')} ${esc(t)}</span>`).join('')}</div>` : ''}
       ${p.facts.length || E ? `<div class="lf-sec"><span>Важное</span><i class="lf-sec-line"></i><small>это помнит ИИ</small></div>
         ${p.facts.map((f, i) => `<div class="lf-row">${icon('feather')}<span class="lf-grow">${esc(f)}</span>${E ? `<button class="lf-iconbtn sm" data-fdel="${i}">${icon('x')}</button>` : ''}</div>`).join('')}
         ${E ? `<div class="lf-row2" style="margin-top:6px"><input id="cd-fact" placeholder="напр.: должна Тони услугу"><button class="lf-btn icon" id="cd-factadd">${icon('plus')}</button></div>` : ''}` : ''}
-      ${E ? `<div class="lf-actions"><button class="lf-btn" id="cd-fill" data-busy="Думаю…">${icon('sparkles')} Заполнить по карточке</button></div>` : ''}
+      ${E ? `<div class="lf-actions"><button class="lf-btn" id="cd-fill" data-busy="Думаю…">${icon('sparkles')} ${c.ai ? 'Заполнить по карточке' : 'Разложить анкету'}</button></div>
+        <div class="lf-hint">${c.ai ? 'ИИ додумает ему увлечения, вкусы, мысли и желания по карточке — проверь и поправь.' : 'Разложит по полям то, что ты написала в «Кто это». Ничего не придумывает — за твоего персонажа решаешь ты.'}</div>` : ''}
       ${E && !c.ai ? `<label class="lf-check"><input type="checkbox" id="cd-share" ${p.share ? 'checked' : ''}> Показывать другим игрокам «Жизнь» и «Связи»</label>` : ''}`;
   }
   if (sub === 'life') {
@@ -509,10 +593,21 @@ function cardBody(d, sub) {
   }
   if (sub === 'rel') {
     if (!d.can_see) return lock;
+    const tris = wl().tris.filter(t => t.who.includes(c.key));
     return `${d.relations.length ? d.relations.map(r => relCard(d, r)).join('') : `<div class="lf-empty">${icon('handshake')}Связей пока нет — Летописец заведёт их сам, когда персонажи встретятся в сцене.</div>`}
-      ${E ? `<button class="lf-btn ghost full" id="cd-reladd">${icon('plus')} Связь вручную</button>` : ''}`;
+      ${E ? `<button class="lf-btn ghost full" id="cd-reladd">${icon('plus')} Связь вручную</button>` : ''}
+      <div class="lf-sec"><span>Треугольники</span><i class="lf-sec-line"></i><small>${tris.length || ''}</small></div>
+      ${tris.map(triCard).join('') || `<div class="lf-hint-i">Треугольников с ${esc(c.name)} нет</div>`}
+      ${E ? `<button class="lf-btn ghost full" id="cd-trinew">${icon('plus')} Треугольник</button>` : ''}`;
   }
   return '';
+}
+function homeHtml(d) {
+  const rooms = S.rooms.filter(r => r.world_id === curWorldId);
+  const home = rooms.find(r => r.id === d.home);
+  if (!d.can_edit) return home ? `<div class="lf-sec"><span>Дом</span><i class="lf-sec-line"></i></div><div class="lf-row">${icon('home')}<span class="lf-grow"><b>${esc(home.title)}</b></span></div>` : '';
+  return `<div class="lf-sec"><span>Дом</span><i class="lf-sec-line"></i><small>${d.char.ai ? 'туда он оставляет записки и подарки' : 'где живёт в этом мире'}</small></div>
+    <div class="lf-field" style="margin-top:0"><select id="cd-home"><option value="">— не задан —</option>${rooms.map(r => `<option value="${r.id}" ${d.home === r.id ? 'selected' : ''}>${esc(r.title)}</option>`).join('')}</select></div>`;
 }
 function itemRow(i) {
   const ic = i.kind === 'транспорт' ? 'car' : i.kind === 'одежда' ? 'shirt' : 'box';
@@ -609,6 +704,9 @@ function bindCard(s, d) {
   on('[data-item]', b => itemSheet(d, d.items.find(i => i.id === +b.dataset.item)));
   // связи
   on('[data-reledit]', b => relSheet(d, d.relations.find(r => r.key === b.dataset.reledit)));
+  on('[data-tri]', b => triSheet(wl().tris.find(t => t.id === b.dataset.tri)));
+  on('#cd-trinew', () => triSheet(null, c.key));
+  const hm = s.querySelector('#cd-home'); if (hm) hm.onchange = () => patchState({ home: +hm.value || null });
   on('#cd-reladd', () => {
     const others = chars().filter(x => x.key !== c.key && !d.relations.some(r => r.key === x.key));
     sheet(`<h2>Связь с кем?</h2>${others.map(o => `<button class="lf-row" data-to="${o.key}">${ava(o)}<span class="lf-grow"><b>${esc(o.name)}</b></span></button>`).join('') || '<div class="lf-hint-i">Со всеми уже есть</div>'}`, x => {
@@ -764,6 +862,7 @@ function renderRoom() {
   <div class="lf-body ${r.kind === 'chat' ? 'chatmode' : ''}" id="scr">
     ${r.cover ? `<div class="lf-frame"><div class="lf-frame-img" style="background-image:url('${esc(r.cover)}')"></div><div class="lf-frame-cap"><h2>${esc(r.title)}</h2><span>${esc(cut(r.description, 90))}</span></div></div>`
       : r.description ? `<div class="lf-locbox">${esc(r.description)}</div>` : ''}
+    <div class="lf-here" id="room-here">${hereHtml()}</div>
     <div class="lf-feed" id="feed">
       ${posts.length >= 50 ? `<button class="lf-loadmore" id="b-more">↑ раньше</button>` : ''}
       ${posts.map(postHtml).join('') || `<div class="lf-empty">${icon('feather')}Начни историю</div>`}
@@ -794,8 +893,97 @@ function renderRoom() {
   const del = document.getElementById('c-img-del'); if (del) del.onclick = () => { composer.image = ''; renderRoom(); };
   const more = document.getElementById('b-more'); if (more) more.onclick = loadMore;
   document.getElementById('feed').addEventListener('click', feedClick);
+  document.getElementById('room-here').addEventListener('click', hereClick);
   scrollDown();
 }
+const TRACE_IC = { trace: 'sparkles', note: 'feather', food: 'utensils', gift: 'gift' };
+const TRACE_L = { trace: 'след', note: 'записка', food: 'еда', gift: 'подарок' };
+function petAva(p) { return p.img ? `<span class="lf-ava"><img src="${esc(p.img)}" alt=""></span>` : `<span class="lf-ava"><i>${icon('paw')}</i></span>`; }
+function hereHtml() {
+  if (!curRoom) return '';
+  const d = wl();
+  const tr = d.traces[curRoom.id] || [];
+  const pets = d.pets.filter(p => p.on !== false && p.home === curRoom.id);
+  const push = d.push[curRoom.id];
+  if (!tr.length && !pets.length && !push) return '';
+  return `${pets.length ? `<div class="lf-chips" style="margin:0 0 4px">${pets.map(p => `<button class="lf-petchip ${p.urgent.length ? 'need' : ''}" data-pet="${p.id}">${petAva(p)}${esc(p.name)}${p.urgent.length ? ` · ${esc(p.needs.find(n => n.v < 30)?.word || 'просит')}` : ''}</button>`).join('')}</div>` : ''}
+    ${tr.map(t => `<div class="lf-trace k-${t.k}"><span class="lf-trace-ic">${icon(TRACE_IC[t.k] || 'sparkles')}</span><span class="lf-trace-t"><em>${TRACE_L[t.k] || 'след'}</em>${esc(t.t)}${t.by ? `<small>от ${esc(t.by)}</small>` : ''}</span><button class="x" data-trdel="${t.id}" title="Убрать">${icon('x')}</button></div>`).join('')}
+    ${push ? `<div class="lf-rumor" style="margin:6px 0"><q>${esc(push)}</q><div class="lf-rumor-f"><small>${icon('ear')} слух в этой сцене — ИИ может его упомянуть</small><button class="lf-iconbtn sm" data-unpush="1">${icon('x')}</button></div></div>` : ''}`;
+}
+function updateRoomHere() {
+  const el = document.getElementById('room-here'); if (!el) return;
+  el.innerHTML = hereHtml();
+}
+async function hereClick(e) {
+  const t = e.target.closest('[data-trdel],[data-pet],[data-unpush]'); if (!t) return;
+  if (t.dataset.pet) return petSheet(t.dataset.pet);
+  if (t.dataset.unpush) { await api(`/api/rooms/${curRoom.id}/rumor`, { method: 'POST', body: { text: '' } }); return; }
+  if (t.dataset.trdel) { try { await api(`/api/worlds/${curRoom.world_id}/traces/${curRoom.id}/${t.dataset.trdel}`, { method: 'DELETE' }); } catch (er) { toast(er.message, true); } }
+}
+function traceForm(roomId = curRoom?.id) {
+  sheet(`<h2>Оставить след</h2><div class="lf-hint">То, что переживёт сцену: записка, цветы на столе, разбитое зеркало. ИИ видит следы этого места.</div>
+    <div class="lf-chips wrap">${Object.entries(TRACE_L).map(([k, l], i) => `<button class="lf-chip mini ${i === 0 ? 'on' : ''}" data-tk="${k}">${icon(TRACE_IC[k])} ${l}</button>`).join('')}</div>
+    <div class="lf-field"><textarea id="tr-text" rows="3" placeholder="напр.: записка на холодильнике «Не жди, вернусь к утру»"></textarea></div>
+    <button class="lf-btn primary full" id="tr-save">Оставить</button>`, s => {
+    let k = 'trace';
+    s.querySelectorAll('[data-tk]').forEach(b => b.onclick = () => { k = b.dataset.tk; s.querySelectorAll('[data-tk]').forEach(x => x.classList.toggle('on', x === b)); });
+    s.querySelector('#tr-save').onclick = async () => {
+      const text = s.querySelector('#tr-text').value.trim(); if (!text) return;
+      try { await api(`/api/worlds/${curWorldId}/traces`, { method: 'POST', body: { room_id: roomId, text, kind: k } }); closeSheet(); } catch (e) { toast(e.message, true); }
+    };
+  });
+}
+
+// ── кат-сцены: на весь экран, кино-полосы, медленный наезд, подписи
+let cutTimer = null;
+function playCut(cut) {
+  const frames = (cut?.frames || []).filter(f => f.img);
+  if (!frames.length) return;
+  stopCut();
+  const el = document.createElement('div');
+  el.id = 'lf-cut';
+  el.innerHTML = `<div class="lf-cut-stage">${frames.map((f, i) => `<div class="lf-cut-f k${i % 4}" style="background-image:url('${esc(f.img)}')"><i class="bl"></i><i class="im"></i></div>`).join('')}</div>
+    <i class="lf-cut-bar top"></i><i class="lf-cut-bar bot"></i>
+    <div class="lf-cut-cap"><small></small><span></span></div>
+    <div class="lf-cut-dots">${frames.map(() => '<b></b>').join('')}</div>
+    <button class="lf-cut-x" aria-label="Закрыть">${icon('x')}</button>`;
+  document.body.append(el);
+  let i = -1;
+  const show = (n) => {
+    if (n >= frames.length) return stopCut();
+    i = n;
+    el.querySelectorAll('.lf-cut-f').forEach((f, k) => { f.classList.toggle('on', k === i); if (k === i) { f.style.animation = 'none'; void f.offsetWidth; f.style.animation = ''; } });
+    el.querySelectorAll('.lf-cut-dots b').forEach((b, k) => b.classList.toggle('on', k <= i));
+    const cap = el.querySelector('.lf-cut-cap');
+    cap.classList.remove('on');
+    cap.querySelector('small').textContent = frames[i].title || '';
+    cap.querySelector('span').textContent = frames[i].caption || '';
+    setTimeout(() => cap.classList.add('on'), 700);
+    clearTimeout(cutTimer);
+    cutTimer = setTimeout(() => show(i + 1), Math.max(5200, 2600 + String(frames[i].caption || '').length * 55));
+  };
+  el.addEventListener('click', (e) => { if (e.target.closest('.lf-cut-x')) return stopCut(); show(i + 1); });
+  requestAnimationFrame(() => { el.classList.add('on'); setTimeout(() => show(0), 650); });
+}
+function stopCut() {
+  clearTimeout(cutTimer);
+  const el = document.getElementById('lf-cut'); if (!el) return;
+  el.classList.remove('on'); setTimeout(() => el.remove(), 500);
+}
+async function makeCut(postId) {
+  if (CUTBUSY[postId]) return;
+  CUTBUSY[postId] = { step: 0, of: 3 };
+  const p = posts.find(x => x.id === postId); if (p) replacePost(p);
+  try {
+    const r = await api(`/api/posts/${postId}/cut`, { method: 'POST' });
+    if (S) S.spent_today = r.spent_today;
+    delete CUTBUSY[postId];
+    await loadWL(curWorldId, true);
+    if (p) replacePost(p);
+    playCut(r.cut);
+  } catch (e) { delete CUTBUSY[postId]; if (p) replacePost(p); toast(e.message, true); }
+}
+
 function scrollDown() { requestAnimationFrame(() => { const sc = document.getElementById('scr'); if (sc) sc.scrollTop = sc.scrollHeight; }); }
 function chronHtml(p) {
   const ch = p.chron;
@@ -804,10 +992,16 @@ function chronHtml(p) {
   return `<div class="lf-chron">${icon('feather')}${ch.chips.map(t => `<span>${esc(t)}</span>`).join('')}
     ${mine ? `<button data-unchron="${p.id}" title="Откатить">${icon('undo')}</button>` : ''}${S.me.is_admin ? `<button data-rechron="${p.id}" title="Перепрогнать">${icon('refresh')}</button>` : ''}</div>`;
 }
+function cutHtml(p) {
+  const b = CUTBUSY[p.id];
+  if (b) return `<div class="lf-cutbusy"><span class="lf-spin"></span> ${b.step ? `Снимаю кат-сцену · кадр ${b.step} из ${b.of}` : 'Раскадровка…'}</div>`;
+  const c = cutOf(p.id);
+  return c ? `<button class="lf-cutchip" data-cut="${c.id}">${icon('play')} ${esc(c.title)}</button>` : '';
+}
 function postHtml(p) {
   const a = postAuthor(p);
   const mine = p.user_id === S.me.id;
-  const menu = mine || S.me.is_admin ? `<button class="lf-iconbtn sm lf-post-menu" data-menu="${p.id}">${icon('more')}</button>` : '';
+  const menu = p.body || mine || S.me.is_admin ? `<button class="lf-iconbtn sm lf-post-menu" data-menu="${p.id}">${icon('more')}</button>` : '';
   const mode = curRoom?.kind === 'chat' ? 'small' : prefs.ava;
   const time = fmtTime(p.created_at) + (p.edited_at ? ' · ред.' : '');
   let head;
@@ -820,7 +1014,7 @@ function postHtml(p) {
   return `<article class="lf-post ${a.ai ? 'ai' : ''} ${p.is_ooc ? 'ooc' : ''}" id="post-${p.id}">${head}
     ${p.body ? `<div class="lf-post-body">${fmtBody(p.body)}</div>` : ''}
     ${p.image ? fit(p.image, 'lf-post-img', '', `data-full="${esc(p.image)}"`) : ''}
-    ${chronHtml(p)}</article>`;
+    ${chronHtml(p)}${cutHtml(p)}</article>`;
 }
 function appendPost(p) {
   const feed = document.getElementById('feed'); if (!feed) return;
@@ -830,7 +1024,8 @@ function appendPost(p) {
 }
 function replacePost(p) { const el = document.getElementById(`post-${p.id}`); if (el) el.outerHTML = postHtml(p); }
 async function feedClick(e) {
-  const t = e.target.closest('[data-menu],[data-card],[data-unchron],[data-rechron],[data-full]'); if (!t) return;
+  const t = e.target.closest('[data-menu],[data-card],[data-unchron],[data-rechron],[data-full],[data-cut]'); if (!t) return;
+  if (t.dataset.cut) return playCut(wl().cuts.find(c => c.id === t.dataset.cut));
   if (t.dataset.menu) return postMenu(+t.dataset.menu);
   if (t.dataset.card) return openCardSheet(t.dataset.card);
   if (t.dataset.full) return sheet(fit(t.dataset.full, '', '', `style="--img:url('${esc(t.dataset.full)}');margin:-18px;height:84dvh"`));
@@ -856,14 +1051,21 @@ async function sendPost() {
 }
 function postMenu(id) {
   const p = posts.find(x => x.id === id); if (!p) return;
+  const own = p.user_id === S.me.id || S.me.is_admin;
+  const c = cutOf(p.id);
   sheet(`<h2>Пост</h2>
-    ${p.body ? `<button class="lf-btn full" id="pm-edit" style="margin-bottom:8px">${icon('pencil')} Редактировать</button>` : ''}
-    <button class="lf-btn full danger" id="pm-del">${icon('trash')} Удалить</button>`, s => {
+    ${p.body && !p.is_ooc ? `<button class="lf-btn full" id="pm-cut" style="margin-bottom:8px">${icon('play')} ${c ? 'Переснять кат-сцену' : 'Снять кат-сцену'}</button>
+      <div class="lf-hint" style="margin:-2px 0 10px">Три кадра по этому посту — общий план и два крупных, в стиле мира. Это 4 запроса: раскадровка и три картинки. ИИ кат-сцену не видит.</div>` : ''}
+    ${c && (c.by === S.me.id || S.me.is_admin) ? `<button class="lf-btn full ghost" id="pm-cutdel" style="margin-bottom:8px">${icon('trash')} Удалить кат-сцену</button>` : ''}
+    ${own && p.body ? `<button class="lf-btn full" id="pm-edit" style="margin-bottom:8px">${icon('pencil')} Редактировать</button>` : ''}
+    ${own ? `<button class="lf-btn full danger" id="pm-del">${icon('trash')} Удалить</button>` : ''}`, s => {
+    const pc = s.querySelector('#pm-cut'); if (pc) pc.onclick = () => { closeSheet(); makeCut(id); };
+    const pd = s.querySelector('#pm-cutdel'); if (pd) pd.onclick = async () => { await api(`/api/worlds/${curRoom.world_id}/cuts/${c.id}`, { method: 'DELETE' }); closeSheet(); };
     const e = s.querySelector('#pm-edit');
     if (e) e.onclick = () => sheet(`<h2>Редактирование</h2><textarea id="pm-text" rows="10">${esc(p.body)}</textarea><button class="lf-btn primary full" id="pm-save" style="margin-top:10px">Сохранить</button>`, s2 => {
       s2.querySelector('#pm-save').onclick = async () => { try { await api(`/api/posts/${id}`, { method: 'PATCH', body: { body: s2.querySelector('#pm-text').value } }); closeSheet(); } catch (er) { toast(er.message, true); } };
     });
-    s.querySelector('#pm-del').onclick = async () => { if (!confirm('Удалить пост?')) return; try { await api(`/api/posts/${id}`, { method: 'DELETE' }); closeSheet(); } catch (er) { toast(er.message, true); } };
+    const del = s.querySelector('#pm-del'); if (del) del.onclick = async () => { if (!confirm('Удалить пост?')) return; try { await api(`/api/posts/${id}`, { method: 'DELETE' }); closeSheet(); } catch (er) { toast(er.message, true); } };
   });
 }
 
@@ -888,6 +1090,8 @@ function sceneSheet() {
     ${groups.map(([g, gl]) => `<div class="lf-field"><label>${gl}</label><div class="lf-chips wrap" style="margin:0">${META.tones.filter(t => t[3] === g).map(([id, l, ic]) => `<button class="lf-chip mini ${sc.tone === id ? 'on' : ''}" data-tone="${id}">${icon(ic)} ${l}</button>`).join('')}</div></div>`).join('')}
     <label class="lf-check"><input type="checkbox" id="sc-preg" ${sc.preg ? 'checked' : ''}> Беременность — модель учитывает живот и грудь</label>
     <label class="lf-check"><input type="checkbox" id="sc-care" ${sc.care !== false ? 'checked' : ''}> Забота после — следующий ответ про «после»</label>
+    <div class="lf-sec"><span>Это место</span><i class="lf-sec-line"></i></div>
+    <div class="lf-actions" style="margin-top:0"><button class="lf-btn small" id="sc-trace">${icon('feather')} Оставить след</button><button class="lf-btn small" id="sc-pet">${icon('paw')} Питомец здесь</button></div>
     <div class="lf-sec"><span>Летописец</span><i class="lf-sec-line"></i><small>${r.chron_on === 0 ? 'выключен' : r.chron_on === 1 || r.kind === 'forum' ? 'после каждого поста' : 'выключен в чате'}</small></div>
     ${last ? `<div class="lf-chron" style="margin:0">${icon('feather')}${last.chron.chips.map(t => `<span>${esc(t)}</span>`).join('')}</div>` : '<div class="lf-hint-i">Пока ничего не отмечено</div>'}
   `, s => {
@@ -898,6 +1102,8 @@ function sceneSheet() {
     s.querySelector('#sc-preg').onchange = e => patch({ preg: e.target.checked });
     s.querySelector('#sc-care').onchange = e => patch({ care: e.target.checked });
     s.querySelectorAll('[data-card]').forEach(b => b.onclick = () => openCardSheet(b.dataset.card));
+    s.querySelector('#sc-trace').onclick = () => traceForm(r.id);
+    s.querySelector('#sc-pet').onclick = () => petForm(null, r.id);
   });
 }
 function chronicleSheet() {
@@ -958,6 +1164,113 @@ function aiSheet() {
       try { const r = await api(`/api/rooms/${curRoom.id}/ai`, { method: 'POST', body: { ai_char_id: +b.dataset.ai, instruction } }); S.spent_today = r.spent_today; } catch (e) { toast(e.message, true); }
     });
   });
+}
+
+// ───────────── слухи в сцену ─────────────
+function pushRumor(text) {
+  if (!text) return;
+  const rooms = S.rooms.filter(r => r.world_id === curWorldId);
+  sheet(`<h2>В какую сцену?</h2><div class="lf-rumor" style="margin:4px 0 12px"><q>${esc(text)}</q></div>
+    ${rooms.map(r => `<button class="lf-row" data-to="${r.id}">${icon(r.kind === 'chat' ? 'message' : 'scene')}<span class="lf-grow"><b>${esc(r.title)}</b>${wl().push[r.id] ? '<small>там уже ходит другой слух — заменю</small>' : ''}</span>${icon('send')}</button>`).join('')}`, s => {
+    s.querySelectorAll('[data-to]').forEach(b => b.onclick = async () => { await api(`/api/rooms/${b.dataset.to}/rumor`, { method: 'POST', body: { text } }); closeSheet(); toast('Слух пошёл — ИИ упомянет его в ближайшем ответе там'); });
+  });
+}
+
+// ───────────── питомцы ─────────────
+function petSheet(id) {
+  const p = wl().pets.find(x => x.id === id);
+  if (!p) return closeSheet();
+  const room = S.rooms.find(r => r.id === p.home);
+  const sh = sheet(`
+    <div class="lf-pethero">${p.img ? fit(p.img, '', '', 'style="position:absolute;inset:0"') : `<span class="lf-pethero-ic">${icon('paw')}</span>`}
+      <button class="lf-glass" id="pt-draw" data-busy="Рисую…">${icon('wand')} ${p.img ? 'Перерисовать' : 'Портрет'}</button>
+      <div class="lf-pethero-t"><h2>${esc(p.name)}</h2><span>${esc(p.kind_label)}${room ? ` · живёт: ${esc(room.title)}` : ''}${p.fav_name ? ` · больше всех любит ${esc(p.fav_name)}` : ''}</span></div></div>
+    <div class="lf-petwords">${p.needs.filter(n => n.k !== 'health').map(n => `<span>${icon(n.ic)} ${esc(n.word)}</span>`).join('')}</div>
+    <div class="lf-bars">${p.needs.map(n => `<div class="lf-bar-row ${n.v < 30 ? 'low' : ''}">${icon(n.ic)}<span>${n.label}</span><span class="lf-meter"><b style="width:${n.v}%"></b></span><small>${n.v}</small><em>${esc(n.word)}</em></div>`).join('')}</div>
+    <div class="lf-actions"><button class="lf-btn" data-act="feed">${icon('utensils')} Покормить</button><button class="lf-btn" data-act="play">${icon('zap')} ${p.kind === 'dog' ? 'Выгулять' : 'Поиграть'}</button><button class="lf-btn" data-act="pet">${icon('heart')} Погладить</button>${p.hurt ? `<button class="lf-btn" id="pt-heal">${icon('activity')} Вылечить</button>` : ''}</div>
+    <div class="lf-hint">Сытость, игра и ласка тают по времени истории. Летописец сам заметит, если в посте кота покормили или потискали.</div>
+    ${p.look ? `<div class="lf-sec"><span>Какой</span><i class="lf-sec-line"></i></div><div class="lf-text">${esc(p.look)}</div>` : ''}
+    ${p.traits?.length ? `<div class="lf-chips wrap">${p.traits.map(t => `<span class="lf-chip mini">${esc(t)}</span>`).join('')}</div>` : ''}
+    ${p.moments?.length ? `<div class="lf-sec"><span>Моменты</span><i class="lf-sec-line"></i></div><div class="lf-moments">${p.moments.slice(-8).reverse().map(m => `<span>${m.bad ? '⚠ ' : ''}${esc(m.t)}</span>`).join('')}</div>` : ''}
+    <div class="lf-actions"><button class="lf-btn" id="pt-edit">${icon('pencil')} Изменить</button><button class="lf-btn danger icon" id="pt-del">${icon('trash')}</button></div>`, s => {
+    const W = curWorldId;
+    const patch = async body => { try { await api(`/api/worlds/${W}/pets/${p.id}`, { method: 'PATCH', body }); } catch (e) { toast(e.message, true); } };
+    s.querySelectorAll('[data-act]').forEach(b => b.onclick = () => patch({ act: b.dataset.act }));
+    const heal = s.querySelector('#pt-heal'); if (heal) heal.onclick = () => patch({ healed: true });
+    s.querySelector('#pt-edit').onclick = () => petForm(p);
+    s.querySelector('#pt-del').onclick = async () => { if (!confirm(`Убрать ${p.name} из истории?`)) return; await api(`/api/worlds/${W}/pets/${p.id}`, { method: 'DELETE' }); closeSheet(); };
+    const d = s.querySelector('#pt-draw');
+    d.onclick = () => busy(d, async () => { try { await patch({ img: await drawImage({ prompt: `Portrait of a ${p.kind === 'dog' ? 'dog' : p.kind === 'cat' ? 'cat' : 'pet'} named ${p.name}: ${p.look || ''}. Cozy home interior, soft light, the animal looks at the viewer.`, aspect: '4:3', refs: [p.img] }) }); } catch (e) { toast(e.message, true); } });
+  });
+  sh.dataset.pet = id;
+}
+function petForm(p, homeRoom) {
+  const kinds = wl().meta.pet_kinds;
+  const rooms = S.rooms.filter(r => r.world_id === curWorldId);
+  const home = p ? p.home : homeRoom ?? null;
+  sheet(`<h2>${p ? esc(p.name) : 'Новый питомец'}</h2>
+    <div class="lf-row2"><div class="lf-field" style="flex:2"><label>Кличка</label><input id="pf2-name" value="${esc(p?.name || '')}" placeholder="Альпин"></div>
+      <div class="lf-field"><label>Кто</label><select id="pf2-kind">${Object.entries(kinds).map(([k, l]) => `<option value="${k}" ${(p?.kind || 'cat') === k ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></div></div>
+    <div class="lf-field"><label>Как выглядит (видит ИИ и художник)</label><textarea id="pf2-look" rows="2" placeholder="рыжий толстый кот с порванным ухом">${esc(p?.look || '')}</textarea></div>
+    <div class="lf-field"><label>Характер (через запятую)</label><input id="pf2-traits" value="${esc((p?.traits || []).join(', '))}" placeholder="наглый, ворует еду, любит коробки"></div>
+    <div class="lf-field"><label>Живёт</label><select id="pf2-home"><option value="">— нигде —</option>${rooms.map(r => `<option value="${r.id}" ${home === r.id ? 'selected' : ''}>${esc(r.title)}</option>`).join('')}</select></div>
+    ${p ? `<div class="lf-field"><label>Больше всех любит (пусто — сам решит по постам)</label><input id="pf2-fav" value="${esc(p.favName || '')}"></div>` : ''}
+    <div class="lf-field"><label>Фото</label>${imgField('pf2-img', p?.img, { draw: true, aspect: '4:3' })}</div>
+    <button class="lf-btn primary full serif" id="pf2-save">Сохранить</button>`, s => {
+    bindImgField(s, 'pf2-img', () => ({ prompt: `Portrait of a ${s.querySelector('#pf2-kind').value === 'dog' ? 'dog' : s.querySelector('#pf2-kind').value === 'cat' ? 'cat' : 'pet'} named ${s.querySelector('#pf2-name').value}: ${s.querySelector('#pf2-look').value}. Cozy home interior, soft light.`, aspect: '4:3', refs: [s.querySelector('#pf2-img').value] }));
+    s.querySelector('#pf2-save').onclick = async () => {
+      const body = { name: s.querySelector('#pf2-name').value.trim(), kind: s.querySelector('#pf2-kind').value, look: s.querySelector('#pf2-look').value, img: s.querySelector('#pf2-img').value,
+        traits: s.querySelector('#pf2-traits').value.split(',').map(x => x.trim()).filter(Boolean), home: +s.querySelector('#pf2-home').value || null };
+      if (p) body.fav = s.querySelector('#pf2-fav').value.trim();
+      if (!body.name) return toast('Кличка?', true);
+      try {
+        if (p) await api(`/api/worlds/${curWorldId}/pets/${p.id}`, { method: 'PATCH', body });
+        else await api(`/api/worlds/${curWorldId}/pets`, { method: 'POST', body });
+        await loadWL(curWorldId, true); closeSheet();
+        if (!curRoom) renderTabs(); else updateRoomHere();
+      } catch (e) { toast(e.message, true); }
+    };
+  });
+}
+
+// ───────────── треугольники ─────────────
+function triSheet(t, preset) {
+  const M = wl().meta;
+  const pool = chars();
+  const st = { who: t ? [...t.who] : preset ? [preset] : [], center: t?.center || preset || '', kind: t?.kind || 'jeal', end: t?.end || 'hold', on: t ? t.on !== false : true };
+  const draw = () => {
+    if (!st.who.includes(st.center)) st.center = st.who[0] || '';
+    s.querySelector('#tr-who').innerHTML = pool.map(c => `<button class="lf-chip ${st.who.includes(c.key) ? 'on' : ''}" data-w="${c.key}">${ava(c, 'xs')} ${esc(c.name)}</button>`).join('');
+    s.querySelector('#tr-center').innerHTML = st.who.length ? st.who.map(k => `<button data-c="${k}" class="${st.center === k ? 'on' : ''}">${esc(charBy(k)?.name || '?')}</button>`).join('') : '<button disabled>сначала выбери троих</button>';
+    s.querySelectorAll('[data-k]').forEach(b => b.classList.toggle('on', b.dataset.k === st.kind));
+    s.querySelectorAll('[data-e]').forEach(b => b.classList.toggle('on', b.dataset.e === st.end));
+    s.querySelector('#tr-n').textContent = `${st.who.length} из 3`;
+    s.querySelectorAll('[data-w]').forEach(b => b.onclick = () => { const k = b.dataset.w; if (st.who.includes(k)) st.who = st.who.filter(x => x !== k); else if (st.who.length < 3) st.who.push(k); else toast('Уже трое — сними кого-нибудь'); draw(); });
+    s.querySelectorAll('[data-c]').forEach(b => b.onclick = () => { st.center = b.dataset.c; draw(); });
+  };
+  const s = sheet(`<h2>${t ? 'Треугольник' : 'Новый треугольник'}</h2>
+    <div class="lf-hint">Трое, где чувства к одному влияют на другого. Когда все трое в сцене — ИИ держит эту ось в поведении. Когда двое, а третьего упомянули, — это отзовётся в реакции.</div>
+    <div class="lf-field"><label>Кто <small id="tr-n"></small></label><div class="lf-chips wrap" id="tr-who"></div></div>
+    <div class="lf-field"><label>В центре</label><div class="lf-seg" id="tr-center" style="margin:0"></div></div>
+    <div class="lf-field"><label>Что между ними</label><div class="lf-chips wrap" style="margin:0">${M.tri_kinds.map(([k, l, ic]) => `<button class="lf-chip mini" data-k="${k}">${icon(ic)} ${esc(l)}</button>`).join('')}</div></div>
+    <div class="lf-field"><label>Куда вести</label><div class="lf-seg" style="margin:0">${M.tri_ends.map(([k, l]) => `<button data-e="${k}">${esc(l)}</button>`).join('')}</div></div>
+    <div class="lf-field"><label>Подробности (видит ИИ)</label><textarea id="tr-note" rows="2" placeholder="напр.: Макс не знает, что Баки ревнует">${esc(t?.note || '')}</textarea></div>
+    ${t ? `<label class="lf-check"><input type="checkbox" id="tr-on" ${st.on ? 'checked' : ''}> Включён</label>` : ''}
+    <div class="lf-actions"><button class="lf-btn primary serif" id="tr-save">Сохранить</button>${t?.can_edit ? `<button class="lf-btn danger icon" id="tr-del">${icon('trash')}</button>` : ''}</div>`, null);
+  s.querySelectorAll('[data-k]').forEach(b => b.onclick = () => { st.kind = b.dataset.k; draw(); });
+  s.querySelectorAll('[data-e]').forEach(b => b.onclick = () => { st.end = b.dataset.e; draw(); });
+  draw();
+  s.querySelector('#tr-save').onclick = async () => {
+    if (st.who.length !== 3) return toast('Нужны ровно трое', true);
+    const body = { who: st.who, center: st.center, kind: st.kind, end: st.end, note: s.querySelector('#tr-note').value };
+    const on = s.querySelector('#tr-on'); if (on) body.on = on.checked;
+    try {
+      if (t) await api(`/api/worlds/${curWorldId}/tris/${t.id}`, { method: 'PATCH', body });
+      else await api(`/api/worlds/${curWorldId}/tris`, { method: 'POST', body });
+      await loadWL(curWorldId, true); closeSheet(); if (!curRoom) renderTabs();
+    } catch (e) { toast(e.message, true); }
+  };
+  const del = s.querySelector('#tr-del'); if (del) del.onclick = async () => { if (!confirm('Удалить треугольник?')) return; await api(`/api/worlds/${curWorldId}/tris/${t.id}`, { method: 'DELETE' }); await loadWL(curWorldId, true); closeSheet(); if (!curRoom) renderTabs(); };
 }
 
 // ───────────── траты ─────────────

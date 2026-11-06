@@ -163,7 +163,7 @@ function needWord(k, v, metab, fem) {
 function bodyView(worldId, key, x = state(worldId, key), p = prof(key)) {
   const hours = worldHours(worldId);
   const { metab, fem } = p;
-  x.wounds = x.wounds.filter(w => hours - (w.at ?? hours) < 48 / metab);
+  x.wounds = x.wounds.filter((w, i, arr) => hours - (w.at ?? hours) < 48 / metab && arr.findIndex(y => norm(y.t) === norm(w.t)) === i);
   const needs = NEEDS.map(([k, label, ic]) => { const v = needOf(x, k, hours, metab); return { k, label, ic, v, word: needWord(k, v, metab, fem) }; });
   const val = (k) => needs.find(n => n.k === k).v;
   const fast = metab >= 2 ? ' (ускоренный метаболизм — ест много и часто)' : metab > 1 ? ' (быстрый метаболизм)' : '';
@@ -316,6 +316,7 @@ function notes(room, speaker, { lastUserText = '' } = {}) {
   } else if (mood && sc.set) {
     out.push(`[Настроение сцены (задано игроком): ${mood[1].toLowerCase()} — ${mood[3]}. Держи его, пока сцена идёт.]`);
   }
+  out.push(...worldNotes(room, here, lastUserText));
   const w = q.worldById.get(W);
   if (w?.clock) out.unshift(`[Время в истории: ${w.clock}.]`);
   return out.join('\n');
@@ -362,13 +363,309 @@ function afterAiPost(room, speaker, postSeq) {
   }
   if (x.spark && !x.spark.used) x.spark.used = postSeq;
   saveState(W, speaker.key, x);
+  afterAiWorld(room);
+}
+
+// ───────────── мир вокруг: дом и следы, питомцы, за кадром, треугольники, слухи, кат-сцены ─────────────
+
+const PET_KINDS = {
+  cat: { label: 'Кот', needs: [['food', 'Сытость', 6], ['play', 'Игра', 5], ['love', 'Ласка', 4], ['health', 'Здоровье', 0]] },
+  dog: { label: 'Пёс', needs: [['food', 'Сытость', 6], ['play', 'Прогулка', 7], ['love', 'Ласка', 5], ['health', 'Здоровье', 0]] },
+  other: { label: 'Питомец', needs: [['food', 'Сытость', 5], ['play', 'Внимание', 4], ['love', 'Ласка', 3], ['health', 'Здоровье', 0]] },
+};
+const PET_ICON = { food: 'utensils', play: 'zap', love: 'heart', health: 'activity' };
+const TRI_KINDS = [
+  ['jeal', 'Ревность', 'eye', '{c} в центре: один ревнует к другому, а тот дразнит, флиртует или просто существует — и этого хватает'],
+  ['loyal', 'Верность', 'handshake', '{c} между двумя, которые друг другу не доверяют: каждый тянет на себя, перемирие держится на {c}'],
+  ['rival', 'Соперники', 'zap', 'двое меряются — за внимание, правоту, место рядом с {c}; {c} — то приз, то судья'],
+  ['secret', 'Тайна', 'lock', 'между ними троими есть недосказанное: один знает то, чего не знает другой, и {c} это чувствует'],
+];
+const TRI_ENDS = [
+  ['hold', 'Держать', 'тлеет и не решается: искры, взгляды, колкости — без развязки'],
+  ['never', 'Не за грань', 'искры и ревность да, но без измены и без разрыва — никогда за грань'],
+  ['blow', 'Взорвать', 'постепенно к открытому столкновению: каждая сцена чуть острее, но не взрывай в одном посте'],
+  ['fade', 'Помирить', 'напряжение постепенно гаснет: шаги навстречу, уважение, перемирие'],
+];
+const TRACE_KINDS = ['trace', 'note', 'food', 'gift'];
+
+function wl(W) {
+  const d = json(q.getWorldLife.get(W)?.data, {});
+  if (!d.traces || typeof d.traces !== 'object' || Array.isArray(d.traces)) d.traces = {};   // room_id → [{id,t,k,by,off,post}]
+  for (const f of ['pets', 'tris', 'offscreen', 'cuts']) if (!Array.isArray(d[f])) d[f] = [];
+  if (!d.homes || typeof d.homes !== 'object') d.homes = {};                               // key → room_id
+  if (!d.push || typeof d.push !== 'object') d.push = {};                                  // room_id → слух для сцены
+  if (!d.rumors) d.rumors = null;
+  return d;
+}
+function saveWl(W, d) { q.setWorldLife.run(W, JSON.stringify(d)); }
+/** Что откатывает «откат Летописца»: следы, питомцы, за кадром. Слухи, кат-сцены, треугольники — нет. */
+const WL_SNAP = ['traces', 'pets', 'offscreen', 'rumorDay'];
+
+function roomsOfWorld(W) { return q.roomsByWorld.all(W); }
+function roomByName(W, name, fallback) {
+  const n = norm(name); if (!n) return fallback;
+  const rooms = roomsOfWorld(W);
+  return rooms.find(r => norm(r.title) === n) || rooms.find(r => norm(r.title).includes(n) || n.includes(norm(r.title))) || fallback;
+}
+function homeOf(W, key, d = wl(W)) {
+  const id = d.homes[key];
+  if (id && q.roomById.get(id)) return id;
+  const r = roomsOfWorld(W).find(r => /квартир|дом\b|домой|апартамент|пентхаус|комнат/i.test(r.title));
+  return r?.id || null;
+}
+
+// ── следы ──
+function addTrace(d, roomId, tr) {
+  if (!roomId || !tr?.t) return null;
+  const arr = d.traces[roomId] = d.traces[roomId] || [];
+  if (arr.some(t => norm(t.t) === norm(tr.t))) return null;
+  const t = { id: uid(), t: cut(tr.t, 80), k: TRACE_KINDS.includes(tr.k) ? tr.k : 'trace', by: tr.by || '', off: !!tr.off, post: tr.post || null };
+  arr.push(t);
+  if (arr.length > 20) arr.splice(0, arr.length - 20);
+  return t;
+}
+function removeTrace(d, roomId, text) {
+  const n = norm(text);
+  const arr = d.traces[roomId] || [];
+  const i = arr.findIndex(t => { const tn = norm(t.t); return tn === n || tn.includes(n) || n.includes(tn); });
+  if (i >= 0) arr.splice(i, 1);
+}
+
+// ── питомцы ──
+const petKind = (p) => PET_KINDS[p.kind] || PET_KINDS.other;
+const guessPetKind = (t) => { t = String(t || '').toLowerCase(); return /кош|кот|кис|cat/.test(t) ? 'cat' : /соба|пёс|пес|щен|dog/.test(t) ? 'dog' : 'other'; };
+function petNeed(p, k, hours) {
+  const e = p.needs?.[k]; const rate = petKind(p).needs.find(n => n[0] === k)?.[2] ?? 4;
+  if (!e) return k === 'health' ? 100 : 80;
+  const h = Math.max(0, hours - (e.at ?? hours));
+  return k === 'health' ? clamp(e.v + h * 1.2) : clamp(e.v - h * rate);
+}
+function setPetNeed(p, k, v, hours) { p.needs = p.needs || {}; p.needs[k] = { v: clamp(v), at: hours }; }
+function petWord(p, k, v) {
+  const dog = p.kind === 'dog';
+  if (k === 'food') return v >= 70 ? 'Сыт' : v >= 40 ? 'Не прочь перекусить' : v >= 20 ? 'Голодный' : 'Орёт от голода';
+  if (k === 'play') return v >= 60 ? (dog ? 'Нагулялся' : 'Наигрался') : v >= 30 ? (dog ? 'Просится гулять' : 'Хочет играть') : (dog ? 'Скулит у двери' : 'Шкодит от скуки');
+  if (k === 'love') return v >= 60 ? 'Довольный' : v >= 30 ? 'Ищет внимания' : 'Обиделся';
+  return v >= 70 ? 'Здоров' : v >= 40 ? 'Вялый' : 'Болеет';
+}
+function petUrgent(p, k, v) {
+  const dog = p.kind === 'dog';
+  if (k === 'food' && v < 30) return dog ? 'голоден — сидит у миски, скулит, ходит хвостом' : 'давно не ел — громко орёт, путается под ногами и требует еду';
+  if (k === 'play' && v < 25) return dog ? 'засиделся без прогулки — носится, тащит поводок, скулит у двери' : 'заскучал — шкодит, носится по дому, нападает на ноги';
+  if (k === 'love' && v < 25) return 'обижен, что на него не обращают внимания — то лезет на руки, то демонстративно игнорирует';
+  if (k === 'health' && v < 45) return `нездоров${p.hurt ? ` (${p.hurt})` : ''} — вялый, прячется`;
+  return '';
+}
+function petFav(p) {
+  if (p.favName) return p.favName;
+  const e = Object.entries(p.fav || {}).sort((a, b) => b[1] - a[1])[0];
+  return e && e[1] >= 2 ? e[0] : '';
+}
+function petView(W, p) {
+  const h = worldHours(W);
+  const needs = petKind(p).needs.map(([k, label]) => { const v = petNeed(p, k, h); return { k, label, ic: PET_ICON[k], v, word: petWord(p, k, v) }; });
+  return { ...p, kind_label: petKind(p).label, needs, urgent: needs.map(n => petUrgent(p, n.k, n.v)).filter(Boolean), fav_name: petFav(p) };
+}
+function newPet(W, d, { name = 'Без имени', kind = 'cat', look = '', home = null } = {}) {
+  const h = worldHours(W);
+  const p = { id: uid(), name: cut(name, 40), kind: PET_KINDS[kind] ? kind : 'other', look: cut(look, 200), traits: [], home, img: '', fav: {}, favName: '', needs: {}, moments: [], hurt: '', on: true };
+  for (const [k] of petKind(p).needs) setPetNeed(p, k, k === 'health' ? 100 : 80, h);
+  d.pets.push(p);
+  return p;
+}
+const findPet = (d, name) => { const n = norm(name); return d.pets.find(p => norm(p.name) === n || norm(p.name).split(' ')[0] === n.split(' ')[0]) || null; };
+
+// ── треугольники ──
+const triKind = (id) => TRI_KINDS.find(k => k[0] === id) || TRI_KINDS[0];
+const triEnd = (id) => TRI_ENDS.find(k => k[0] === id) || TRI_ENDS[0];
+function triHeat(W, t) {
+  const vals = [];
+  const [x, y, z] = t.who;
+  for (const [a, b] of [[x, y], [y, z], [x, z]]) for (const [f, to] of [[a, b], [b, a]]) {
+    const r = rel(W, f, to); if (!r._exists) continue;
+    vals.push(Math.max(r.jealousy, r.tension, t.kind === 'secret' ? r.guilt : 0));
+  }
+  if (!vals.length) return 0;
+  vals.sort((a, b) => b - a);
+  return Math.round((vals[0] + (vals[1] ?? vals[0])) / 2);
+}
+function triLine(W, t, mode) {
+  const nm = (k) => charInfo(k)?.name || '?';
+  const c = nm(t.center);
+  const sides = t.who.filter(k => k !== t.center).map(nm);
+  const heat = triHeat(W, t);
+  const head = `Треугольник ${sides[0]} — ${c} — ${sides[1]}`;
+  const what = triKind(t.kind)[3].replaceAll('{c}', c);
+  const note = t.note ? ` ${t.note}.` : '';
+  if (mode === 'all') return `${head}: ${what}. Накал ${heat < 35 ? 'низкий' : heat < 65 ? 'заметный' : 'высокий'}. Куда идёт: ${triEnd(t.end)[2]}.${note} Держи эту ось в поведении всех троих, не проговаривай её и не решай в одном посте.`;
+  return `${head}: ${what}.${note} Третьего упомянули — пусть это отзовётся в реакции, но не втаскивай его в сцену.`;
+}
+function mentions(text, name) {
+  const w = norm(name).split(' ')[0]; if (w.length < 3) return false;
+  const stem = w.length <= 4 ? w : w.slice(0, -1);
+  return new RegExp(`(^|[^a-zа-яё])${stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i').test(norm(text));
+}
+function triNotes(W, here, lastUserText, d = wl(W)) {
+  const lines = [];
+  for (const t of d.tris.filter(t => t.on !== false && t.who?.length === 3)) {
+    const inScene = t.who.filter(k => here.some(h => h.key === k));
+    if (inScene.length === 3) lines.push(triLine(W, t, 'all'));
+    else if (inScene.length === 2) { const third = t.who.find(k => !inScene.includes(k)); const c = charInfo(third); if (c && mentions(lastUserText, c.name)) lines.push(triLine(W, t, 'shadow')); }
+  }
+  return lines.length ? `[${lines.slice(0, 2).join(' ')}]` : '';
+}
+
+// ── за кадром: ИИ сам что-то сделал, пока игроков не было рядом ──
+function maybeOffscreen(W, room, post, d) {
+  const here = new Set(presentOf(room).map(c => c.key));
+  const h = worldHours(W);
+  const lastAny = Math.max(-999, ...d.offscreen.map(e => e.post || 0));
+  if (post.id - lastAny < 6) return null;
+  const ais = q.aiChars.all().filter(c => !c.world_id || c.world_id === W).map(c => keyOf('a', c.id)).filter(k => !here.has(k)).sort(() => Math.random() - 0.5);
+  for (const k of ais) {
+    const p = prof(k);
+    if (p.inner === false) continue;
+    const [pr] = FREQ[p.init.freq] || FREQ.off;
+    if (!pr || Math.random() > pr * 0.8) continue;
+    const x = state(W, k);
+    const pool = x.ideas.filter(i => i.status === 'new' && i.when === 'offscreen' && p.init.kinds.includes(i.kind));
+    if (!pool.length) continue;
+    const pick = pool[Math.floor(Math.random() * pool.length)];
+    const roomId = (pick.where && roomByName(W, pick.where, null)?.id) || homeOf(W, k, d);
+    pick.status = 'done'; pick.doneAt = post.id; x.lastInit = post.id; saveState(W, k, x);
+    const c = charInfo(k);
+    const e = { id: uid(), key: k, who: c?.name || '?', t: pick.text, room_id: roomId, at: h, post: post.id, seen: false };
+    d.offscreen.push(e); if (d.offscreen.length > 40) d.offscreen.splice(0, d.offscreen.length - 40);
+    if (roomId) addTrace(d, roomId, { t: pick.text, k: pick.kind === 'gift' ? 'gift' : 'note', by: c?.name || '', off: true, post: post.id });
+    return e;
+  }
+  return null;
+}
+
+/** Мир вокруг сцены — для заметки модели. */
+function worldNotes(room, here, lastUserText) {
+  const W = room.world_id, d = wl(W), out = [];
+  const tr = d.traces[room.id] || [];
+  if (tr.length) out.push(`[Следы в этом месте (их видно, они могут попасть в сцену): ${tr.map(t => `${t.t}${t.by && t.off ? ` — от ${t.by}` : ''}`).join('; ')}.]`);
+  const players = here.filter(c => !c.ai).map(c => c.name).join(', ') || 'игроков';
+  for (const e of d.offscreen.filter(e => !e.seen && e.room_id === room.id)) out.push(`[За кадром, пока ${players} не было рядом, ${e.who}: ${e.t}. Это уже случилось. Если сейчас это можно обнаружить — пусть обнаружат.]`);
+  for (const p of d.pets.filter(p => p.on !== false && p.home === room.id)) {
+    const v = petView(W, p);
+    const traits = (p.traits || []).slice(0, 4).join(', ');
+    const fav = v.fav_name;
+    out.push(`[Питомец здесь: ${v.kind_label.toLowerCase()} ${p.name}${p.look ? ` (${cut(p.look, 80)})` : ''}${traits ? `, характер: ${traits}` : ''}${fav ? `, больше всех любит ${fav}` : ''}${v.urgent.length ? ` — ${v.urgent.join('; ')}. Пусть требует своего` : ' — спокоен, может просто быть рядом'}.]`);
+  }
+  const tri = triNotes(W, here, lastUserText, d); if (tri) out.push(tri);
+  if (d.push[room.id]) out.push(`[Слух, который сейчас ходит: «${d.push[room.id]}». Кто-то из персонажей может его упомянуть или на него отреагировать.]`);
+  return out;
+}
+
+/** Для Летописца: места, следы, питомцы. */
+function worldChronInput(room) {
+  const W = room.world_id, d = wl(W), lines = [];
+  const rooms = roomsOfWorld(W);
+  lines.push(`Места мира: ${rooms.map(r => r.title).join('; ')}`);
+  const tr = d.traces[room.id] || [];
+  lines.push(`Следы здесь (${room.title}): ${tr.map(t => t.t).join('; ') || '—'}`);
+  const pets = d.pets.filter(p => p.on !== false);
+  if (pets.length) lines.push(`Питомцы: ${pets.map(p => `${p.name} (${petKind(p).label.toLowerCase()}${p.home ? `, живёт: ${q.roomById.get(p.home)?.title || '?'}` : ''})`).join('; ')}`);
+  return lines.join('\n');
+}
+
+function applyWorld(room, post, j, cast) {
+  const W = room.world_id, d = wl(W), h = worldHours(W);
+  const chips = [];
+  for (const x of Array.isArray(j.traces) ? j.traces.slice(0, 4) : []) {
+    if (!x?.text) continue;
+    const r = roomByName(W, x.where, room);
+    if (x.op === 'remove') removeTrace(d, r.id, x.text);
+    else if (addTrace(d, r.id, { t: x.text, k: x.kind, post: post.id })) chips.push(cut(x.text, 40));
+  }
+  for (const e of Array.isArray(j.pets) ? j.pets : []) {
+    if (!e?.name) continue;
+    let p = findPet(d, e.name);
+    if (!p && e.new) { p = newPet(W, d, { name: e.name.charAt(0).toUpperCase() + e.name.slice(1), kind: guessPetKind(e.kind), look: e.look || '', home: room.id }); chips.push(`Питомец: ${p.name}`); }
+    if (!p) continue;
+    if (e.fed) setPetNeed(p, 'food', 100, h);
+    if (e.played) setPetNeed(p, 'play', 100, h);
+    if (e.petted) setPetNeed(p, 'love', petNeed(p, 'love', h) + 45, h);
+    if (e.hurt) { setPetNeed(p, 'health', petNeed(p, 'health', h) - 35, h); p.hurt = cut(e.hurt, 50); p.moments.push({ t: cut(e.hurt, 60), post: post.id, bad: true }); }
+    if (e.with) { const c = findC(namesMap(cast), e.with); if (c) p.fav[c.name] = (p.fav[c.name] || 0) + 1; }
+    if (e.moment) p.moments.push({ t: cut(e.moment, 60), post: post.id });
+    if (p.moments.length > 30) p.moments.splice(0, p.moments.length - 30);
+  }
+  // идеи «за кадром» записывает apply() в ideas; тут — шанс, что кто-то из ИИ не в сцене сделает одну
+  const off = maybeOffscreen(W, room, post, d);
+  saveWl(W, d);
+  return { chips, off };
+}
+
+/** После поста ИИ в комнате: что было за кадром — обнаружено, слух — сыгран. */
+function afterAiWorld(room) {
+  const W = room.world_id, d = wl(W);
+  let ch = false;
+  for (const e of d.offscreen) if (!e.seen && e.room_id === room.id) { e.seen = true; ch = true; }
+  if (d.push[room.id]) { delete d.push[room.id]; ch = true; }
+  if (ch) saveWl(W, d);
+}
+
+const RUMORS_SYSTEM = `Ты — городская хроника и сарафанное радио мира ролевой истории на русском.
+Новости — что происходит в мире вокруг героев (город, работа, события, погода, громкие истории) в духе сеттинга.
+Слухи — что говорят о героях знакомые, соседи, бармены, коллеги, таблоиды, соцсети: смесь правды, полуправды и вранья.
+Опирайся только на свежие события из списка. Не приписывай героям поступков, которых не было: слухи искажают то, что было, а не выдумывают новое. Тайны — только намёком. Без пошлости.
+Ответь только JSON: {"news":[{"title":"заголовок","text":"1–2 предложения","about":["имя"]}],"rumors":[{"text":"что говорят, 1–2 предложения","source":"кто и где","about":["имя"],"truth":"правда|полуправда|враньё"}]}. 3 новости, 4 слуха.`;
+
+function rumorsInput(W) {
+  const w = q.worldById.get(W), d = wl(W);
+  const ev = [];
+  for (const r of q.recentChronInWorld.all(W, 40).reverse()) { const c = json(r.chron, null); if (c?.chips?.length) ev.push(`- ${c.chips.join('; ')}`); }
+  const names = [...q.allPersonas.all().map(p => p.name), ...q.aiChars.all().filter(c => !c.world_id || c.world_id === W).map(c => c.name)];
+  const tris = d.tris.filter(t => t.on !== false && t.who?.length === 3).map(t => `- ${t.who.map(k => charInfo(k)?.name || '?').join(' — ')}`);
+  return [
+    `Мир: ${w?.title || ''}${w?.prompt ? `\n${cut(w.prompt, 1500)}` : ''}`,
+    w?.clock ? `Сейчас в истории: ${w.clock}` : '',
+    `Герои: ${names.join(', ')}`,
+    `Места: ${roomsOfWorld(W).map(r => r.title).join(', ')}`,
+    `Свежие события:\n${ev.join('\n') || '—'}`,
+    tris.length ? `Треугольники (сплетники это чуют — можно намекнуть):\n${tris.join('\n')}` : '',
+    d.rumors?.rumors?.length ? `Прошлые слухи (не повторяй):\n${d.rumors.rumors.map(r => `- ${r.text}`).join('\n')}` : '',
+  ].filter(Boolean).join('\n\n');
+}
+function saveRumors(W, j) {
+  const d = wl(W), s = (v, n) => cut(String(v ?? '').trim(), n);
+  const news = (Array.isArray(j?.news) ? j.news : []).filter(x => x?.text).slice(0, 4).map(x => ({ title: s(x.title, 80), text: s(x.text, 400), about: (Array.isArray(x.about) ? x.about : []).map(String).slice(0, 4) }));
+  const rumors = (Array.isArray(j?.rumors) ? j.rumors : []).filter(x => x?.text).slice(0, 5).map(x => ({ text: s(x.text, 400), source: s(x.source, 80), about: (Array.isArray(x.about) ? x.about : []).map(String).slice(0, 4), truth: ['правда', 'полуправда', 'враньё'].includes(x.truth) ? x.truth : 'полуправда' }));
+  if (!news.length && !rumors.length) throw Object.assign(new Error('Хроника ответила пусто'), { status: 502 });
+  d.rumorsOld = [d.rumors, ...(d.rumorsOld || [])].filter(Boolean).slice(0, 3);
+  d.rumors = { at: Date.now(), clock: q.worldById.get(W)?.clock || '', day: Math.floor(worldHours(W) / 24), news, rumors };
+  d.rumorDay = d.rumors.day;
+  saveWl(W, d);
+  return d.rumors;
+}
+/** Новый день истории → пора за свежими слухами (true — один раз за день). */
+function newDay(W) {
+  const d = wl(W), day = Math.floor(worldHours(W) / 24);
+  if (d.rumorDay == null) { d.rumorDay = day; saveWl(W, d); return false; }
+  if (day <= d.rumorDay) return false;
+  d.rumorDay = day; saveWl(W, d); return true;
+}
+
+const CUT_SYSTEM = `You are a film director's storyboard assistant. From one roleplay post you pick 3 key frames for a short cutscene and write image prompts.
+Return ONLY JSON: {"title":"short Russian title of the moment, 2-4 words","frames":[{"title":"Общий план","who":["exact names in frame"],"caption":"one short Russian line from or about the post, max 90 chars","prompt":"English image prompt, 45-70 words: shot type and angle, who is in frame BY NAME ONLY (never describe their faces, hair, eye or skin colour), pose, expression, clothing, setting, light, mood; cinematic film still"}]}
+Frame 1 is a wide establishing shot of the place and the people. Frames 2 and 3 are close-ups or medium shots of the two most important reactions or gestures. Follow the post exactly: same place, time of day, weather, clothes. Never explicit.`;
+function cutInput(room, post) {
+  const W = room.world_id, w = q.worldById.get(W);
+  const cast = castOf(room);
+  const clothes = cast.map(c => { const x = state(W, c.key); return x.outfit ? `${c.name}: ${x.outfit}` : ''; }).filter(Boolean).join('; ');
+  const author = postKey(post) ? charInfo(postKey(post))?.name : 'narrator';
+  return { text: `Place: ${room.title}${room.description ? ` — ${cut(room.description, 300)}` : ''}. Time: ${w?.clock || '?'}.\nPeople in the story: ${cast.map(c => c.name).join(', ')}.\nClothes now: ${clothes || '?'}\n\nPOST by ${author}:\n${cut(post.body, 4000)}`, cast };
 }
 
 // ───────────── Летописец ─────────────
 
 const CHRON_SYSTEM = `Ты — Летописец ролевой истории на русском. Ты не пишешь историю, а ведёшь её учёт по последнему посту.
 Верни ТОЛЬКО JSON, без пояснений и без markdown:
-{"chips":[],"time":{"passed_min":0,"clock":""},"outfit":[],"items":[],"relations":[],"inner":[],"prefs":[],"ideas":[],"done":[],"scene":{"mood":"calm","intim":0,"tone":"","end":false}}
+{"chips":[],"time":{"passed_min":0,"clock":""},"outfit":[],"items":[],"relations":[],"inner":[],"prefs":[],"ideas":[],"done":[],"traces":[],"pets":[],"scene":{"mood":"calm","intim":0,"tone":"","end":false}}
 
 chips — 0–4 коротких факта о том, что изменилось в ЭТОМ посте, по 2–5 слов: «Приехали в бар», «Ключи у Хеди», «Баки отдал зажигалку». Ничего не изменилось — [].
 
@@ -388,8 +685,12 @@ inner — тело и внутренняя жизнь персонажей по 
 
 prefs — что стало ясно про вкусы: [{"who":"имя","text":"1–5 слов","kind":"like|dislike"}]. Только сказанное или явно показанное. Нечего — [].
 
-ideas — 0–2 новые идеи, что ИИ-персонаж из строки «Инициатива» мог бы сделать САМ в ближайших сценах — чтобы жил своей жизнью, а не только отвечал. [{"who":"имя","kind":"care|court|flirt|touch|spicy|gift|own|talk|plot","text":"8–20 слов, конкретно и в его характере","when":"scene|later"}]. care — забота; court — ухаживание, романтический жест; flirt — подкат, комплимент; touch — касание мимоходом; spicy — пошлость вслух; gift — подарок с учётом вкусов; own — свои дела, независимость; talk — сам начинает важный разговор; plot — сюжетный ход по его линии. court/flirt/touch/spicy — только если между ними есть романтика. Опирайся на характер, отношения, вкусы. Не повторяй уже задуманное.
+ideas — 0–2 новые идеи, что ИИ-персонаж из строки «Инициатива» мог бы сделать САМ в ближайших сценах — чтобы жил своей жизнью, а не только отвечал. [{"who":"имя","kind":"care|court|flirt|touch|spicy|gift|own|talk|plot","text":"8–20 слов, конкретно и в его характере","when":"scene|later|offscreen","where":"место из «Места мира», если важно"}]. when: scene — прямо в этой сцене; later — в другой раз; offscreen — сделает сам, пока игроков нет рядом (оставит записку, приготовит ужин, купит и спрячет подарок) — тогда text как уже сделанное: «приготовил ужин и оставил записку на холодильнике». care — забота; court — ухаживание, романтический жест; flirt — подкат, комплимент; touch — касание мимоходом; spicy — пошлость вслух; gift — подарок с учётом вкусов; own — свои дела, независимость; talk — сам начинает важный разговор; plot — сюжетный ход по его линии. court/flirt/touch/spicy — только если между ними есть романтика. Опирайся на характер, отношения, вкусы. Не повторяй уже задуманное.
 done — номера идей из «Уже задумано», которые в ЭТОМ посте сбылись. Нет — [].
+
+traces — следы в местах, которые переживут эту сцену: [{"op":"add|remove","where":"место из «Места мира» или пусто — здесь","text":"что осталось, 3–10 слов","kind":"trace|note|food|gift"}]. Бокалы после вечеринки, разбитое зеркало, его футболка после ночёвки, записка на холодильнике (в text — суть записки), ужин в духовке, цветы на столе. remove — следа больше нет (убрали, съели, выкинули), text — как в списке «Следы». Мелочи, которые завтра никто не вспомнит, не пиши. Нечего — [].
+
+pets — что случилось с питомцами в этом посте: [{"name":"кличка","fed":false,"played":false,"petted":false,"hurt":"","with":"кто был с ним","moment":"3–8 слов, если был милый или важный момент","new":false,"kind":"кошка|собака|…","look":"как выглядит"}]. new — true, только если в истории появился новый питомец героев. Ничего — [].
 
 scene — тон этого поста: mood — ${MOOD_IDS.join('|')}|calm; intim: 0 — без близости, 1 — флирт и поцелуи, 2 — секс или откровенная близость прямо сейчас; tone — только при intim 2: ${TONE_IDS.join('|')}; end — true, если близость в этом посте закончилась.`;
 
@@ -441,6 +742,7 @@ function chronInput(room, post) {
   const rels = [];
   for (const a of cast) for (const b of cast) if (a.key !== b.key) { const r = rel(W, a.key, b.key); if (r._exists) rels.push(`${a.name} → ${b.name}: ${SCALES.map(([k, l]) => `${l.toLowerCase()} ${r[k]}`).join(', ')}`); }
   if (rels.length) lines.push(`Отношения сейчас:\n${rels.join('\n')}`);
+  lines.push(worldChronInput(room));
   if (prev.length) lines.push(`Перед этим:\n${prev.map(renderPost).join('\n\n')}`);
   lines.push(`ПОСЛЕДНИЙ ПОСТ (его и разбирай):\n${renderPost(post)}`);
   return { text: lines.join('\n\n'), cast };
@@ -457,7 +759,9 @@ function parseJson(text) {
 function snapshot(room, cast) {
   const W = room.world_id;
   const world = q.worldById.get(W);
-  const s = { world: { hours: world.hours, clock: world.clock }, scene: room.scene, states: {}, profs: {}, rels: [], items: {} };
+  const d = wl(W);
+  const s = { world: { hours: world.hours, clock: world.clock }, scene: room.scene, states: {}, profs: {}, rels: [], items: {}, wl: Object.fromEntries(WL_SNAP.map(k => [k, d[k] ?? null])) };
+  for (const c of q.aiChars.all().filter(c => !c.world_id || c.world_id === W)) { const k = keyOf('a', c.id); s.states[k] = q.getState.get(W, k)?.data ?? null; }  // «за кадром» трогает и тех, кого нет в сцене
   for (const c of cast) {
     s.states[c.key] = q.getState.get(W, c.key)?.data ?? null;
     s.profs[c.key] = q.getProf.get(c.key)?.data ?? null;
@@ -470,6 +774,7 @@ function restore(room, snap) {
   const W = room.world_id;
   q.setWorldTime.run(snap.world.hours, snap.world.clock, W);
   q.setRoomScene.run(snap.scene, room.id);
+  if (snap.wl) { const d = wl(W); for (const k of WL_SNAP) d[k] = snap.wl[k]; saveWl(W, d); }
   for (const [k, d] of Object.entries(snap.states)) d == null ? q.delState.run(W, k) : q.setState.run(W, k, d);
   for (const [k, d] of Object.entries(snap.profs)) if (d != null) q.setProf.run(k, d);
   for (const [a, b, d] of snap.rels) d == null ? q.delRel.run(W, a, b) : q.setRel.run(W, a, b, d);
@@ -580,7 +885,7 @@ function apply(room, post, j, cast) {
     const c = findC(map, r.who); if (!c?.ai || !r.text) continue;
     const x = state(W, c.key);
     if (x.ideas.some(i => norm(i.text) === norm(r.text))) continue;
-    x.ideas.push({ id: uid(), kind: IDEA_KINDS[r.kind] ? r.kind : 'care', text: cut(r.text, 160), when: r.when === 'later' ? 'later' : 'scene', status: 'new', post: post.id });
+    x.ideas.push({ id: uid(), kind: IDEA_KINDS[r.kind] ? r.kind : 'care', text: cut(r.text, 160), when: ['later', 'offscreen'].includes(r.when) ? r.when : 'scene', where: cut(r.where || '', 40), status: 'new', post: post.id });
     const fresh = x.ideas.filter(i => i.status === 'new');
     if (fresh.length > 8) fresh[0].status = 'skip';
     x.ideas = x.ideas.slice(-30);
@@ -600,12 +905,16 @@ function apply(room, post, j, cast) {
     q.setRoomScene.run(JSON.stringify(sc), room.id);
   }
 
-  return { chips, passed, clock, author };
+  const wx = applyWorld(room, post, j, cast);
+  for (const c of wx.chips) if (chips.length < 5) chips.push(c);
+  return { chips, passed, clock, author, offscreen: wx.off };
 }
 
 module.exports = {
   NEEDS, STATES, MOODS, TONES, SCALES, IDEA_KINDS, FREQ,
   keyOf, parseKey, charInfo, postKey, prof, saveProf, state, saveState, bodyView, stateLabel,
   rel, saveRel, relBits, sceneOf, sceneNow, castOf, presentOf, notes, arm, afterAiPost,
+  PET_KINDS, TRI_KINDS, TRI_ENDS, wl, saveWl, homeOf, petView, newPet, setPetNeed, petNeed, triHeat, addTrace, newDay,
+  RUMORS_SYSTEM, rumorsInput, saveRumors, CUT_SYSTEM, cutInput, namesMap, findC,
   CHRON_SYSTEM, chronInput, parseJson, snapshot, restore, numberLists, apply, norm, cut, json, uid, setNeed, needOf, worldHours,
 };
